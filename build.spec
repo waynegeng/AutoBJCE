@@ -24,27 +24,32 @@ a = Analysis(
         'playwright',
         'playwright.async_api',
         'playwright._impl._driver',
-        # 图像处理
-        'PIL',
-        'PIL.Image',
-        'cv2',
-        # 网络
+        # 真正用到的网络库
         'aiohttp',
-        'aiohttp.connector',
-        # 其他
-        'dotenv',
-        'DrissionPage',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # 排除不需要的大型库，减小体积
+        # 测试相关
         'pytest',
         'pytest_playwright',
+        # 项目未使用的数据库/框架
         'tortoise',
         'aiosqlite',
         'atlastk',
+        # 项目未使用的大型依赖（源码未 import；排除其被 DrissionPage 等拖入）
+        'DrissionPage',
+        'cv2',
+        'numpy',
+        'PIL',
+        'Pillow',
+        'dotenv',
+        'openpyxl',
+        'lxml',
+        'pandas',
+        'matplotlib',
+        'scipy',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

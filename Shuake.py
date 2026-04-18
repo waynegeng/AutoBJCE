@@ -3,20 +3,41 @@ from getcourseid import Get_course_id
 import asyncio
 import random
 import time
-import os
+
+
+# ── 固定的专题入口（需求：必修 / 选修 两条链接写死） ────────────────────────
+MANDATORY_URL = "https://bjce.bjdj.gov.cn/#/course/courseResources?activedIndex=1&id=zhengzhililun"
+MANDATORY_CHANNEL = "zhengzhililun"
+OPTIONAL_URL = "https://bjce.bjdj.gov.cn/#/course/courseResources?activedIndex=4&id=zonghesuzhi"
+OPTIONAL_CHANNEL = "zonghesuzhi"
+
+# 网络波动自愈等待时长（秒）
+RECOVERY_WAIT_SEC = 180
+# 登录阶段等待时长（毫秒）
+LOGIN_TIMEOUT_MS = 180000
+
+
+class NoRemainingCourseError(Exception):
+    """当前专题页面已无未完成课程。"""
 
 
 class Shuake:
-    def __init__(self, user: dict, course_url: str, channel_id: str, log_cb=None):
+    def __init__(
+        self,
+        user: dict,
+        mandatory_target: float,
+        optional_target: float,
+        log_cb=None,
+    ):
         """
         user: {"name": str, "username": str, "password": str}
-        course_url: 课程页面 URL
-        channel_id: 专题 ID
+        mandatory_target: 目标必修学时（<=0 表示不刷必修）
+        optional_target: 目标选修学时（<=0 表示不刷选修）
         log_cb: 日志回调函数 log_cb(str)，不传则 fallback 到 print
         """
         self.user = user
-        self.course_url = course_url
-        self.channel_id = channel_id
+        self.mandatory_target = float(mandatory_target or 0)
+        self.optional_target = float(optional_target or 0)
         self._log = log_cb if log_cb else print
         self._stop = False
 
@@ -26,6 +47,7 @@ class Shuake:
     def stop(self):
         self._stop = True
 
+    # ── 主流程 ────────────────────────────────────────────────────────────────
     async def start(self):
         async with async_playwright() as playwright:
             self.browser = await playwright.chromium.launch(
@@ -34,26 +56,77 @@ class Shuake:
             self.context = await self.browser.new_context()
             self.page = await self.context.new_page()
 
-            await self._goto_with_retry("https://bjce.bjdj.gov.cn/#/")
-            await self.login()
-
-            await self._wait_login_ready(timeout_ms=180000)
-
             try:
-                await self.check_user_core()
-            except Exception as e:
-                self.log(f"调用 check_user_core 方法失败，错误信息：{e}")
-
-            try:
-                await self.start_shuake()
-            except Exception as e:
-                self.log(f"网络异常，错误信息：{e}，请再次运行！")
+                await self._goto_with_retry("https://bjce.bjdj.gov.cn/#/")
+                await self.login()
+                await self._wait_login_ready(timeout_ms=180000)
+                await self._main_loop()
             finally:
                 try:
                     await self.browser.close()
                 except Exception:
                     pass
 
+    async def _main_loop(self):
+        """按目标学时在必修/选修之间自动切换，直到两类均达标或用户停止。"""
+        current_kind = None  # 记录上一次刷的类型，尽量避免来回跳转
+        while not self._stop:
+            try:
+                m, o = await self.check_user_core()
+            except Exception as e:
+                await self._recover_after_error(e)
+                continue
+
+            need_m = self.mandatory_target > 0 and m < self.mandatory_target
+            need_o = self.optional_target > 0 and o < self.optional_target
+            if not need_m and not need_o:
+                self.log("必修 / 选修均已达标，任务完成。")
+                return
+
+            # 优先保持上一次的类型（避免频繁切页）
+            if current_kind == "必修" and need_m:
+                kind = "必修"
+            elif current_kind == "选修" and need_o:
+                kind = "选修"
+            elif need_m:
+                kind = "必修"
+            else:
+                kind = "选修"
+
+            if kind != current_kind:
+                self.log("=" * 30 + f" ▶ 切换到 {kind} 继续学习 " + "=" * 30)
+                current_kind = kind
+
+            url, cid = (MANDATORY_URL, MANDATORY_CHANNEL) if kind == "必修" else (OPTIONAL_URL, OPTIONAL_CHANNEL)
+            progress_now = m if kind == "必修" else o
+            target_now = self.mandatory_target if kind == "必修" else self.optional_target
+            self.log(f"当前目标：{kind} {progress_now} / {target_now} 学时")
+
+            try:
+                await self._run_one_course(url, cid)
+            except NoRemainingCourseError:
+                # 当前专题页面没有未完成课；若对应类型仍未达标，说明该专题本身课程不足
+                self.log(f"专题「{kind}」下已无剩余未完成课程。")
+                if kind == "必修" and need_m:
+                    # 若仍需必修但必修专题没课了，尝试切到选修；若也达标则结束
+                    if need_o:
+                        current_kind = "选修"
+                        continue
+                    self.log("必修专题课程已枯竭，但目标仍未达成；请手动确认后重试。")
+                    return
+                if kind == "选修" and need_o:
+                    if need_m:
+                        current_kind = "必修"
+                        continue
+                    self.log("选修专题课程已枯竭，但目标仍未达成；请手动确认后重试。")
+                    return
+            except Exception as e:
+                await self._recover_after_error(e)
+
+        if self._stop:
+            self.log("已手动停止刷课。")
+
+    # ── 登录 / 页面就绪 ───────────────────────────────────────────────────────
     async def _wait_login_ready(self, timeout_ms: int = 180000):
         start = time.time()
         while (time.time() - start) * 1000 < timeout_ms:
@@ -85,99 +158,98 @@ class Shuake:
         self.log(f"正在登录用户：{selected_user['name']}")
 
         try:
-            await self.page.wait_for_load_state('networkidle')
+            await self.page.wait_for_load_state('domcontentloaded')
 
-            login_button = await self.page.wait_for_selector('//span[text()="请登录"]', timeout=16000)
+            login_button = await self.page.wait_for_selector('//span[text()="请登录"]', timeout=LOGIN_TIMEOUT_MS)
             await login_button.click()
 
-            await self.page.wait_for_load_state('networkidle')
+            await self.page.wait_for_load_state('domcontentloaded')
 
-            login_option = await self.page.wait_for_selector('//div[text()="登录"]', timeout=16000)
+            login_option = await self.page.wait_for_selector('//div[text()="登录"]', timeout=LOGIN_TIMEOUT_MS)
             await login_option.click()
 
-            username_input = await self.page.wait_for_selector('[placeholder="请输入账号"]', timeout=16000)
+            username_input = await self.page.wait_for_selector('[placeholder="请输入账号"]', timeout=LOGIN_TIMEOUT_MS)
             if username_input:
                 await username_input.fill(selected_user["username"])
             else:
                 self.log("用户名输入框未找到，请检查选择器。")
                 return
 
-            password_input = await self.page.wait_for_selector('[placeholder="请输入密码"]', timeout=16000)
+            password_input = await self.page.wait_for_selector('[placeholder="请输入密码"]', timeout=LOGIN_TIMEOUT_MS)
             if password_input:
                 await password_input.fill(selected_user["password"])
             else:
                 self.log("密码输入框未找到，请检查选择器。")
                 return
 
-            wxlogin_button = await self.page.wait_for_selector('//span[text()="微信认证登录"]', timeout=16000)
+            wxlogin_button = await self.page.wait_for_selector('//span[text()="微信认证登录"]', timeout=LOGIN_TIMEOUT_MS)
             await wxlogin_button.click()
             self.log(f"用户 {selected_user['name']} 登录成功！")
 
         except Exception as e:
             self.log(f"登录过程中发生错误：{e}")
+            raise
 
-    async def check_user_core(self):
-        try:
-            await self.page.wait_for_load_state('load')
+    # ── 学时查询 ──────────────────────────────────────────────────────────────
+    async def check_user_core(self) -> tuple[float, float]:
+        """读取首页必修/选修已学学时，返回 (mandatory, optional)。"""
+        # 为了每次都能读到最新值，强制回到首页
+        await self._goto_with_retry("https://bjce.bjdj.gov.cn/#/")
+        await self.page.wait_for_load_state('load')
 
-            mandatory_div = await self.page.wait_for_selector('div.iv-row-left-bottom-div2')
-            mandatory_score_element = await mandatory_div.query_selector('span[style="font-size: 40px; font-weight: 600;"]')
-            mandatory_score = await mandatory_score_element.inner_text() if mandatory_score_element else "N/A"
-            self.log(f"必修学时: {mandatory_score}")
+        async def _read(selector: str) -> float:
+            div = await self.page.wait_for_selector(selector, timeout=LOGIN_TIMEOUT_MS)
+            el = await div.query_selector('span[style="font-size: 40px; font-weight: 600;"]')
+            if not el:
+                return 0.0
+            text = (await el.inner_text()).strip()
+            try:
+                return float(text)
+            except ValueError:
+                return 0.0
 
-            optional_div = await self.page.wait_for_selector('div.iv-row-left-bottom-div3')
-            optional_score_element = await optional_div.query_selector('span[style="font-size: 40px; font-weight: 600;"]')
-            optional_score = await optional_score_element.inner_text() if optional_score_element else "N/A"
-            self.log(f"选修学时: {optional_score}")
-        except Exception as e:
-            self.log(f"提取用户学时信息失败，错误信息：{e}")
+        mandatory = await _read('div.iv-row-left-bottom-div2')
+        optional = await _read('div.iv-row-left-bottom-div3')
+        self.log(f"已学学时：必修 {mandatory} / 选修 {optional}")
+        return mandatory, optional
 
-    async def get_course_link(self):
-        await self.page.goto(self.course_url)
+    # ── 刷课（每次只刷一门后返回，由外层决定切换） ────────────────────────────
+    async def _get_course_link(self, url: str, channel_id: str):
+        await self._goto_with_retry(url)
         cookies = await self.context.cookies()
         cookies = '; '.join([f"{cookie['name']}={cookie['value']}" for cookie in cookies])
 
-        container = await self.page.wait_for_selector('div.iv-template-every > ul')
+        container = await self.page.wait_for_selector('div.iv-template-every > ul', timeout=30000)
         course_items = await container.query_selector_all('li[data-v-d50a91fc]')
         rowlength = len(course_items)
 
-        uncompleted_courses = await Get_course_id(cookies, self.channel_id, rowlength, 1)
+        uncompleted_courses = await Get_course_id(cookies, channel_id, rowlength, 1)
         return uncompleted_courses
 
-    async def start_shuake(self):
-        uncompleted_courses = await self.get_course_link()
-        completed_courses = []
+    async def _run_one_course(self, url: str, channel_id: str):
+        """在指定专题页面下刷一门未完成课程；若无剩余课程则抛 NoRemainingCourseError。"""
+        uncompleted_courses = await self._get_course_link(url, channel_id)
         self.log(f"本链接剩余课程 {len(uncompleted_courses)} 门")
 
-        while uncompleted_courses and not self._stop:
-            current_course = uncompleted_courses.pop(0)
-            course_name = current_course.get("name")
-            progress = current_course.get("progress") or 0
-            set_type = current_course.get("setType")
+        if not uncompleted_courses:
+            raise NoRemainingCourseError()
 
-            self.log(f"尝试进入课程: 《{course_name}》，进度: {progress}")
+        current_course = uncompleted_courses[0]
+        course_name = current_course.get("name")
+        progress = current_course.get("progress") or 0
+        set_type = current_course.get("setType")
 
-            try:
-                success = await self.simulate_click_to_play_course(course_name, set_type)
-                if not success:
-                    self.log(f"课程《{course_name}》进入失败，跳过此课程。")
-                    await self.close_and_return_to_main_window()
-                    continue
-                completed_courses.append(current_course)
-                self.log(f"成功完成课程: 《{course_name}》")
-            except Exception as e:
-                self.log(f"进入课程《{course_name}》时发生错误：{e}")
-                await self.close_and_return_to_main_window()
-                continue
+        self.log(f"尝试进入课程：《{course_name}》，进度：{progress}")
+        success = await self._simulate_click_to_play_course(course_name, set_type)
+        if not success:
+            self.log(f"课程《{course_name}》进入失败，跳过。")
+            await self._close_and_return_to_main_window()
+            return
+        self.log(f"成功完成课程：《{course_name}》")
 
-        if self._stop:
-            self.log("已手动停止刷课。")
-        else:
-            self.log("所有课程已完成！")
-
-    async def simulate_click_to_play_course(self, course_name, set_type):
+    async def _simulate_click_to_play_course(self, course_name, set_type):
         try:
-            await self.page.wait_for_load_state('networkidle')
+            await self.page.wait_for_load_state('domcontentloaded')
             await asyncio.sleep(2)
 
             course_item = await self.page.query_selector(f"div.iv-zhezhao-courseName:text-is('{course_name}')")
@@ -210,22 +282,26 @@ class Shuake:
                 self.log("未检测到新窗口或 URL 变化，请检查页面逻辑")
 
             if set_type == 1:
-                await self.monitor_course_progress(course_name)
+                await self._monitor_course_progress(course_name)
             elif set_type == 3:
-                await self.play_series_sections()
+                await self._play_series_sections()
 
-            await self.close_and_return_to_main_window()
+            await self._close_and_return_to_main_window()
             return True
 
         except Exception as e:
             self.log(f"进入课程《{course_name}》时发生错误：{e}")
-            await self.close_and_return_to_main_window()
-            return False
+            await self._close_and_return_to_main_window()
+            # 让外层 _recover_after_error 统一处理网络级异常
+            raise
 
-    async def close_and_return_to_main_window(self):
+    async def _close_and_return_to_main_window(self):
         all_pages = self.context.pages
         if len(all_pages) > 1:
-            await self.page.close()
+            try:
+                await self.page.close()
+            except Exception:
+                pass
             await asyncio.sleep(1)
             self.page = all_pages[0]
             self.log("已切换回主课程页面窗口。")
@@ -233,8 +309,8 @@ class Shuake:
         else:
             self.log("未检测到新窗口，无需切换。")
 
-    async def fetch_course_sections(self):
-        await self.page.wait_for_load_state('networkidle')
+    async def _fetch_course_sections(self):
+        await self.page.wait_for_load_state('domcontentloaded')
 
         sections = await self.page.query_selector_all("ul.iv-course-play-detail-menu-item > li")
         completed_sections = []
@@ -256,9 +332,9 @@ class Shuake:
 
         return completed_sections, uncompleted_sections
 
-    async def play_series_sections(self):
-        await self.page.wait_for_load_state('networkidle')
-        completed_sections, uncompleted_sections = await self.fetch_course_sections()
+    async def _play_series_sections(self):
+        await self.page.wait_for_load_state('domcontentloaded')
+        completed_sections, uncompleted_sections = await self._fetch_course_sections()
 
         while uncompleted_sections and not self._stop:
             current_section = uncompleted_sections.pop(0)
@@ -266,15 +342,15 @@ class Shuake:
             section_element = current_section["element"]
             await section_element.click()
             await asyncio.sleep(6)
-            self.log(f"开始学习小节课: {title}")
-            await self.monitor_course_progress(title)
+            self.log(f"开始学习小节课：{title}")
+            await self._monitor_course_progress(title)
             completed_sections.append(current_section)
-            self.log(f"完成学习小节课: {title}")
+            self.log(f"完成学习小节课：{title}")
 
         self.log("系列课程学习完成！")
-        await self.close_and_return_to_main_window()
+        await self._close_and_return_to_main_window()
 
-    async def monitor_course_progress(self, course_name):
+    async def _monitor_course_progress(self, course_name):
         self.log("监控播放状态中...")
 
         total_timeout = 3600
@@ -304,20 +380,20 @@ class Shuake:
 
             if is_paused and video_duration and current_time >= video_duration - 1:
                 self.log(f"{course_name} 播放完成，关闭页面并返回主界面。")
-                await self.close_and_return_to_main_window()
+                await self._close_and_return_to_main_window()
                 break
 
             if time.time() - last_activity_time >= activity_interval:
-                await self.simulate_user_activity()
+                await self._simulate_user_activity()
                 last_activity_time = time.time()
 
             await asyncio.sleep(10)
 
         if time.time() - start_time >= total_timeout:
             self.log("播放超时，尝试重新启动课程。")
-            await self.close_and_return_to_main_window()
+            await self._close_and_return_to_main_window()
 
-    async def simulate_user_activity(self):
+    async def _simulate_user_activity(self):
         activity_type = random.choice(["mouse_move", "scroll"])
 
         if activity_type == "mouse_move":
@@ -328,3 +404,41 @@ class Shuake:
             scroll_distance = random.randint(-10, 10)
             await self.page.evaluate(f"window.scrollBy(0, {scroll_distance})")
             self.log(f"模拟页面滚动：滚动距离 {scroll_distance}")
+
+    # ── 网络自愈 ──────────────────────────────────────────────────────────────
+    async def _recover_after_error(self, e: Exception):
+        self.log(f"遇到异常：{e}")
+        self.log(f"将于 {RECOVERY_WAIT_SEC} 秒后刷新页面重试。")
+
+        # 每 30 秒打印一次倒计时，期间响应 _stop
+        waited = 0
+        while waited < RECOVERY_WAIT_SEC:
+            if self._stop:
+                return
+            await asyncio.sleep(1)
+            waited += 1
+            if waited % 30 == 0 and waited < RECOVERY_WAIT_SEC:
+                self.log(f"恢复倒计时：还剩 {RECOVERY_WAIT_SEC - waited} 秒...")
+
+        # 确保只剩一个主窗口（课程播放窗口可能已崩溃）
+        try:
+            pages = self.context.pages
+            if len(pages) > 1:
+                for p in pages[1:]:
+                    try:
+                        await p.close()
+                    except Exception:
+                        pass
+                self.page = pages[0]
+        except Exception:
+            pass
+
+        try:
+            await self.page.reload(timeout=90000, wait_until="domcontentloaded")
+            self.log("页面已刷新，继续学习。")
+        except Exception:
+            try:
+                await self._goto_with_retry("https://bjce.bjdj.gov.cn/#/")
+                self.log("已重新打开首页，继续学习。")
+            except Exception as e2:
+                self.log(f"恢复时仍失败：{e2}，将在下轮继续尝试。")

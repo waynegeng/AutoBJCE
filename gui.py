@@ -24,15 +24,20 @@ DEFAULT_CONFIG = {
         {"name": "用户2", "username": "", "password": ""},
         {"name": "用户3", "username": "", "password": ""},
     ],
-    "course_url": "https://bjce.bjdj.gov.cn/#/course/courseResources?activedIndex=4&id=zonghesuzhi",
-    "channel_id": "zonghesuzhi",
+    "mandatory_target": 10,
+    "optional_target": 40,
 }
 
 def load_config() -> dict:
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                cfg = json.load(f)
+            # 补齐缺失字段（兼容老配置）
+            cfg.setdefault('mandatory_target', 10)
+            cfg.setdefault('optional_target', 40)
+            cfg.setdefault('users', DEFAULT_CONFIG['users'])
+            return cfg
         except Exception:
             pass
     return json.loads(json.dumps(DEFAULT_CONFIG))
@@ -53,8 +58,8 @@ def save_config(cfg: dict):
             "",
         ]
     lines += [
-        f"COURSE_URL={cfg['course_url']}",
-        f"CHANNEL_ID={cfg['channel_id']}",
+        f"MANDATORY_TARGET={cfg.get('mandatory_target', 0)}",
+        f"OPTIONAL_TARGET={cfg.get('optional_target', 0)}",
     ]
     with open(env_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
@@ -115,20 +120,26 @@ class App(tk.Tk):
             ttk.Entry(acc_frame, textvariable=pwd_var, width=14, show='*').grid(row=row+1, column=2, padx=4, pady=2)
             self._user_vars.append({"name": name_var, "username": uname_var, "password": pwd_var})
 
-        # ── 课程配置区 ────────────────────────────────────────────────────────
-        course_frame = ttk.LabelFrame(self, text=" 课程配置 ")
-        course_frame.grid(row=1, column=0, columnspan=2, sticky='ew', **pad)
+        # ── 学习目标区 ────────────────────────────────────────────────────────
+        goal_frame = ttk.LabelFrame(self, text=" 学习目标（学时） ")
+        goal_frame.grid(row=1, column=0, columnspan=2, sticky='ew', **pad)
 
-        ttk.Label(course_frame, text="课程链接:").grid(row=0, column=0, sticky='w', padx=6, pady=3)
-        self._url_var = tk.StringVar()
-        ttk.Entry(course_frame, textvariable=self._url_var, width=55).grid(row=0, column=1, padx=4, pady=3)
+        ttk.Label(goal_frame, text="必修目标学时:").grid(row=0, column=0, sticky='w', padx=6, pady=3)
+        self._mandatory_var = tk.StringVar()
+        ttk.Entry(goal_frame, textvariable=self._mandatory_var, width=10).grid(row=0, column=1, sticky='w', padx=4, pady=3)
 
-        ttk.Label(course_frame, text="专题 ID:").grid(row=1, column=0, sticky='w', padx=6, pady=3)
-        self._cid_var = tk.StringVar()
-        ttk.Entry(course_frame, textvariable=self._cid_var, width=30).grid(row=1, column=1, sticky='w', padx=4, pady=3)
+        ttk.Label(goal_frame, text="选修目标学时:").grid(row=0, column=2, sticky='w', padx=16, pady=3)
+        self._optional_var = tk.StringVar()
+        ttk.Entry(goal_frame, textvariable=self._optional_var, width=10).grid(row=0, column=3, sticky='w', padx=4, pady=3)
 
-        ttk.Button(course_frame, text="保存配置", command=self._save).grid(
-            row=2, column=0, columnspan=2, pady=6
+        ttk.Label(
+            goal_frame,
+            text="提示：填写本年度期望达到的总学时。刷到目标即自动切换另一类，全部达标后结束。",
+            foreground='gray',
+        ).grid(row=1, column=0, columnspan=4, sticky='w', padx=6, pady=(0, 4))
+
+        ttk.Button(goal_frame, text="保存配置", command=self._save).grid(
+            row=2, column=0, columnspan=4, pady=6
         )
 
         # ── 操作区 ────────────────────────────────────────────────────────────
@@ -165,8 +176,20 @@ class App(tk.Tk):
             uv['name'].set(u.get('name', ''))
             uv['username'].set(u.get('username', ''))
             uv['password'].set(u.get('password', ''))
-        self._url_var.set(self._cfg.get('course_url', ''))
-        self._cid_var.set(self._cfg.get('channel_id', ''))
+        self._mandatory_var.set(str(self._cfg.get('mandatory_target', 0)))
+        self._optional_var.set(str(self._cfg.get('optional_target', 0)))
+
+    def _parse_target(self, s: str, label: str) -> float:
+        s = (s or '').strip()
+        if s == '':
+            return 0.0
+        try:
+            v = float(s)
+        except ValueError:
+            raise ValueError(f"{label} 必须是数字")
+        if v < 0:
+            raise ValueError(f"{label} 不能为负数")
+        return v
 
     def _collect_fields(self) -> dict:
         return {
@@ -178,12 +201,16 @@ class App(tk.Tk):
                 }
                 for uv in self._user_vars
             ],
-            "course_url": self._url_var.get().strip(),
-            "channel_id": self._cid_var.get().strip(),
+            "mandatory_target": self._parse_target(self._mandatory_var.get(), "必修目标学时"),
+            "optional_target": self._parse_target(self._optional_var.get(), "选修目标学时"),
         }
 
     def _save(self):
-        self._cfg = self._collect_fields()
+        try:
+            self._cfg = self._collect_fields()
+        except ValueError as e:
+            messagebox.showwarning("输入有误", str(e))
+            return
         save_config(self._cfg)
         self._refresh_combo()
         messagebox.showinfo("已保存", "配置已保存！")
@@ -196,7 +223,11 @@ class App(tk.Tk):
 
     # ── 刷课控制 ──────────────────────────────────────────────────────────────
     def _start(self):
-        self._cfg = self._collect_fields()
+        try:
+            self._cfg = self._collect_fields()
+        except ValueError as e:
+            messagebox.showwarning("输入有误", str(e))
+            return
 
         idx = self._user_combo.current()
         if idx < 0:
@@ -208,11 +239,15 @@ class App(tk.Tk):
             messagebox.showwarning("提示", "所选用户的账号或密码为空，请先填写并保存。")
             return
 
-        if not self._cfg['course_url'] or not self._cfg['channel_id']:
-            messagebox.showwarning("提示", "课程链接或专题 ID 为空，请先填写并保存。")
+        m_target = float(self._cfg['mandatory_target'])
+        o_target = float(self._cfg['optional_target'])
+        if m_target <= 0 and o_target <= 0:
+            messagebox.showwarning("提示", "请至少设置一个大于 0 的目标学时（必修或选修）。")
             return
 
-        self._append_log(f">>> 开始刷课，用户：{user['name']}\n")
+        self._append_log(
+            f">>> 开始刷课，用户：{user['name']}；目标：必修 {m_target} / 选修 {o_target}\n"
+        )
         self._start_btn.config(state='disabled')
         self._stop_btn.config(state='normal')
 
@@ -220,8 +255,8 @@ class App(tk.Tk):
             from Shuake import Shuake
             self._shuake = Shuake(
                 user=user,
-                course_url=self._cfg['course_url'],
-                channel_id=self._cfg['channel_id'],
+                mandatory_target=m_target,
+                optional_target=o_target,
                 log_cb=lambda msg: self._log_queue.put(msg),
             )
             try:
