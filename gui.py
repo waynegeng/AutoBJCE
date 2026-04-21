@@ -86,7 +86,7 @@ _fix_playwright_driver()
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("AutoBJCE 干部网络学院刷课工具")
+        self.title("AutoBJCE-京网院学习助手")
         self.resizable(False, False)
 
         self._cfg = load_config()
@@ -138,8 +138,21 @@ class App(tk.Tk):
             foreground='gray',
         ).grid(row=1, column=0, columnspan=4, sticky='w', padx=6, pady=(0, 4))
 
+        # 进度显示区（根据已学学时 / 目标学时换算百分比）
+        ttk.Label(goal_frame, text="必修进度:").grid(row=2, column=0, sticky='w', padx=6, pady=3)
+        self._m_progress_bar = ttk.Progressbar(goal_frame, length=150, maximum=100)
+        self._m_progress_bar.grid(row=2, column=1, sticky='w', padx=4, pady=3)
+        self._m_progress_label = ttk.Label(goal_frame, text="--")
+        self._m_progress_label.grid(row=2, column=2, columnspan=2, sticky='w', padx=4, pady=3)
+
+        ttk.Label(goal_frame, text="选修进度:").grid(row=3, column=0, sticky='w', padx=6, pady=3)
+        self._o_progress_bar = ttk.Progressbar(goal_frame, length=150, maximum=100)
+        self._o_progress_bar.grid(row=3, column=1, sticky='w', padx=4, pady=3)
+        self._o_progress_label = ttk.Label(goal_frame, text="--")
+        self._o_progress_label.grid(row=3, column=2, columnspan=2, sticky='w', padx=4, pady=3)
+
         ttk.Button(goal_frame, text="保存配置", command=self._save).grid(
-            row=2, column=0, columnspan=4, pady=6
+            row=4, column=0, columnspan=4, pady=6
         )
 
         # ── 操作区 ────────────────────────────────────────────────────────────
@@ -169,6 +182,13 @@ class App(tk.Tk):
 
         ttk.Button(log_frame, text="清空日志", command=self._clear_log).pack(anchor='e', padx=4, pady=2)
 
+        ttk.Label(
+            self,
+            text="© waynegeng  |  仅供内部学习交流使用，请勿用于商业或违规用途",
+            foreground='gray',
+            anchor='center',
+        ).grid(row=4, column=0, columnspan=2, pady=(0, 6))
+
     # ── 字段加载 / 保存 ───────────────────────────────────────────────────────
     def _load_fields(self):
         for i, uv in enumerate(self._user_vars):
@@ -178,6 +198,24 @@ class App(tk.Tk):
             uv['password'].set(u.get('password', ''))
         self._mandatory_var.set(str(self._cfg.get('mandatory_target', 0)))
         self._optional_var.set(str(self._cfg.get('optional_target', 0)))
+        self._update_progress(0.0, 0.0)
+
+    def _render_progress_text(self, current: float, target: float, percent: float) -> str:
+        if target <= 0:
+            return "目标未设置 (N/A)"
+        return f"{current:.1f} / {target:.1f} 学时 ({percent:.1f}%)"
+
+    def _update_progress(self, mandatory_hours: float, optional_hours: float):
+        m_target = float(self._cfg.get('mandatory_target', 0) or 0)
+        o_target = float(self._cfg.get('optional_target', 0) or 0)
+
+        m_percent = 0.0 if m_target <= 0 else min(100.0, max(0.0, mandatory_hours / m_target * 100.0))
+        o_percent = 0.0 if o_target <= 0 else min(100.0, max(0.0, optional_hours / o_target * 100.0))
+
+        self._m_progress_bar['value'] = m_percent
+        self._o_progress_bar['value'] = o_percent
+        self._m_progress_label.config(text=self._render_progress_text(mandatory_hours, m_target, m_percent))
+        self._o_progress_label.config(text=self._render_progress_text(optional_hours, o_target, o_percent))
 
     def _parse_target(self, s: str, label: str) -> float:
         s = (s or '').strip()
@@ -258,6 +296,7 @@ class App(tk.Tk):
                 mandatory_target=m_target,
                 optional_target=o_target,
                 log_cb=lambda msg: self._log_queue.put(msg),
+                progress_cb=lambda m, o: self._log_queue.put(f"__PROGRESS__|{m}|{o}"),
             )
             try:
                 asyncio.run(self._shuake.start())
@@ -284,6 +323,13 @@ class App(tk.Tk):
                     self._start_btn.config(state='normal')
                     self._stop_btn.config(state='disabled')
                     self._append_log(">>> 刷课任务已结束。\n")
+                elif isinstance(msg, str) and msg.startswith("__PROGRESS__|"):
+                    try:
+                        _, m_str, o_str = msg.split("|")
+                        self._update_progress(float(m_str), float(o_str))
+                    except Exception:
+                        # 进度消息异常不影响主流程
+                        pass
                 else:
                     self._append_log(msg + '\n')
         except queue.Empty:

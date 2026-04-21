@@ -28,17 +28,20 @@ class Shuake:
         mandatory_target: float,
         optional_target: float,
         log_cb=None,
+        progress_cb=None,
     ):
         """
         user: {"name": str, "username": str, "password": str}
         mandatory_target: 目标必修学时（<=0 表示不刷必修）
         optional_target: 目标选修学时（<=0 表示不刷选修）
         log_cb: 日志回调函数 log_cb(str)，不传则 fallback 到 print
+        progress_cb: 学时进度回调 progress_cb(mandatory: float, optional: float)
         """
         self.user = user
         self.mandatory_target = float(mandatory_target or 0)
         self.optional_target = float(optional_target or 0)
         self._log = log_cb if log_cb else print
+        self._progress_cb = progress_cb
         self._stop = False
 
     def log(self, msg: str):
@@ -211,6 +214,8 @@ class Shuake:
         mandatory = await _read('div.iv-row-left-bottom-div2')
         optional = await _read('div.iv-row-left-bottom-div3')
         self.log(f"已学学时：必修 {mandatory} / 选修 {optional}")
+        if self._progress_cb:
+            self._progress_cb(mandatory, optional)
         return mandatory, optional
 
     # ── 刷课（每次只刷一门后返回，由外层决定切换） ────────────────────────────
