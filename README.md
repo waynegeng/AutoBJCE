@@ -25,7 +25,7 @@ AutoBJCE-京网院学习助手 是一个面向 Windows 的干部网络学院课�
 ## 运行环境要求
 
 - 操作系统：Windows 10/11（推荐）
-- 浏览器：已安装 Google Chrome（必须）
+- 浏览器：已安装任意 Chromium 内核浏览器（Chrome / Edge / Brave / Vivaldi / Opera / Chromium 等，自动探测，也可手动指定）
 - 网络：可正常访问 `bjce.bjdj.gov.cn`
 
 ## 最快使用方式（EXE）
@@ -59,7 +59,20 @@ GUI 主配置文件，位于程序目录（EXE 同目录）。
 
 > 必修 / 选修的专题链接已写死在 `Shuake.py`（`MANDATORY_URL` / `OPTIONAL_URL`），无需也无法在界面修改。
 
-### 2) `.env`
+### 2) 浏览器配置项
+
+`config.json` 中的 `browser` 字段决定使用哪个浏览器，取值有三种：
+
+- `"auto"`（默认）：自动探测本机已安装的 Chromium 内核浏览器，按
+  Chrome → Edge → Brave → Vivaldi → Opera → Chromium → 360 / QQ / 搜狗 的顺序尝试；
+- Playwright channel 名：`"chrome"`、`"chrome-beta"`、`"chrome-dev"`、`"msedge"`、
+  `"msedge-beta"`、`"msedge-dev"`；
+- 浏览器可执行文件绝对路径，例如 `"C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"`。
+
+在界面「浏览器」下拉框里选择「自动检测」即可，也可以点「浏览…」手动指定 exe。
+日志里会打印实际使用的浏览器；若某个浏览器启动失败，会自动换下一个候选。
+
+### 3) `.env`
 
 由 GUI 自动同步生成，主要用于兼容旧流程。
 
@@ -73,7 +86,18 @@ GUI 主配置文件，位于程序目录（EXE 同目录）。
 
 1. 确认使用的是最新 `dist/AutoBJCE/AutoBJCE.exe`。
 2. 重新构建 `dist` 后再运行。
-3. 确认系统已安装 Chrome。
+3. 确认系统已安装任意 Chromium 内核浏览器（Chrome / Edge / Brave 等），或在界面中手动指定浏览器 exe。
+
+### Q1-2：日志提示"没有可用的 Chromium 内核浏览器"
+
+程序会依次尝试：界面/配置指定的浏览器 → 自动探测到的本机浏览器 → Playwright 内置 Chromium。
+全部失败时会打印每个候选的失败原因。
+
+排查建议：
+
+1. 确认至少装了一个 Chromium 内核浏览器；没装的话装 Chrome / Edge / Brave 均可。
+2. 若浏览器装在非默认目录，点「浏览…」手动指定 exe。
+3. 日志出现"调试端口接管"说明该内核不支持 Playwright 默认的管道模式，程序已自动降级，属正常现象。
 
 ### Q2：登录时弹验证码，无法继续
 
@@ -104,6 +128,9 @@ pip install -r requirements.txt
 pip install python-dotenv aiohttp DrissionPage
 python -m playwright install chromium
 ```
+
+> `playwright install chromium` 是可选的：源码运行时它作为"没装任何浏览器"时的最后兜底，
+> 打包产物不含该内核，因此正式使用请依赖本机已安装的 Chromium 内核浏览器。
 
 ### 2) 启动 GUI
 
@@ -140,13 +167,14 @@ iscc installer/AutoBJCE.iss
 
 - `installer/Output/AutoBJCE-Setup.exe`
 
-> 安装脚本会检查 Chrome 是否存在；若未检测到会弹出提示，但允许继续安装。
+> 安装脚本会检查是否安装了任意 Chromium 内核浏览器；若未检测到会弹出提示，但允许继续安装。
 
 ## 仓库结构（关键文件）
 
 - `gui.py`：GUI 主入口
 - `Shuake.py`：自动化核心逻辑
 - `getcourseid.py`：课程数据接口处理
+- `browser_launcher.py`：Chromium 内核浏览器探测与启动（含调试端口降级）
 - `build.spec`：PyInstaller 打包配置
 - `installer/AutoBJCE.iss`：Inno Setup 安装脚本
 

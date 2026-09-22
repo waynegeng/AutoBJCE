@@ -1,11 +1,13 @@
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, filedialog
 import threading
 import asyncio
 import queue
 import json
 import os
 import sys
+
+from browser_launcher import PREF_AUTO, detect_browsers
 
 
 # ── 路径工具（兼容 PyInstaller 打包后的运行环境） ──────────────────────────
@@ -26,6 +28,7 @@ DEFAULT_CONFIG = {
     ],
     "mandatory_target": 10,
     "optional_target": 40,
+    "browser": PREF_AUTO,
 }
 
 def load_config() -> dict:
@@ -37,6 +40,7 @@ def load_config() -> dict:
             cfg.setdefault('mandatory_target', 10)
             cfg.setdefault('optional_target', 40)
             cfg.setdefault('users', DEFAULT_CONFIG['users'])
+            cfg.setdefault('browser', PREF_AUTO)
             return cfg
         except Exception:
             pass
@@ -93,6 +97,9 @@ class App(tk.Tk):
         self._log_queue: queue.Queue = queue.Queue()
         self._worker_thread: threading.Thread | None = None
         self._shuake = None
+        self._browser_value = str(self._cfg.get('browser') or PREF_AUTO)
+        self._detected_browsers = detect_browsers()
+        self._browser_options: list[tuple[str, str]] = []
 
         self._build_ui()
         self._load_fields()
@@ -170,6 +177,20 @@ class App(tk.Tk):
         self._stop_btn = ttk.Button(ctrl_frame, text="■ 停止", command=self._stop, state='disabled')
         self._stop_btn.grid(row=0, column=3, padx=4)
 
+        ttk.Label(ctrl_frame, text="浏览器:").grid(row=1, column=0, padx=4, pady=(6, 0))
+        self._browser_combo = ttk.Combobox(ctrl_frame, state='readonly', width=14)
+        self._browser_combo.grid(row=1, column=1, padx=4, pady=(6, 0))
+        self._browser_combo.bind('<<ComboboxSelected>>', self._on_browser_selected)
+        ttk.Button(ctrl_frame, text="浏览…", command=self._pick_browser).grid(
+            row=1, column=2, padx=8, pady=(6, 0)
+        )
+        ttk.Label(
+            ctrl_frame,
+            text="任意 Chromium 内核浏览器均可（Chrome / Edge / Brave…）",
+            foreground='gray',
+        ).grid(row=2, column=0, columnspan=4, sticky='w', padx=4, pady=(2, 0))
+        self._refresh_browser_combo()
+
         # ── 日志区 ────────────────────────────────────────────────────────────
         log_frame = ttk.LabelFrame(self, text=" 运行日志 ")
         log_frame.grid(row=3, column=0, columnspan=2, sticky='nsew', **pad)
@@ -198,6 +219,8 @@ class App(tk.Tk):
             uv['password'].set(u.get('password', ''))
         self._mandatory_var.set(str(self._cfg.get('mandatory_target', 0)))
         self._optional_var.set(str(self._cfg.get('optional_target', 0)))
+        self._browser_value = str(self._cfg.get('browser') or PREF_AUTO)
+        self._refresh_browser_combo()
         self._update_progress(0.0, 0.0)
 
     def _render_progress_text(self, current: float, target: float, percent: float) -> str:
@@ -241,6 +264,7 @@ class App(tk.Tk):
             ],
             "mandatory_target": self._parse_target(self._mandatory_var.get(), "必修目标学时"),
             "optional_target": self._parse_target(self._optional_var.get(), "选修目标学时"),
+            "browser": self._browser_value or PREF_AUTO,
         }
 
     def _save(self):
@@ -258,6 +282,44 @@ class App(tk.Tk):
         self._user_combo['values'] = names
         if names:
             self._user_combo.current(0)
+
+    # ── 浏览器选择 ────────────────────────────────────────────────────────────
+    def _refresh_browser_combo(self):
+        """下拉框 = 自动探测 + 本机探测到的浏览器 + 配置里手动指定的浏览器。"""
+        self._browser_options = [("自动检测（推荐）", PREF_AUTO)]
+        for browser in self._detected_browsers:
+            label = f"{browser.name}（{browser.channel}）" if browser.channel else browser.name
+            self._browser_options.append((label, browser.key))
+
+        current = (self._browser_value or PREF_AUTO).strip()
+        if current.lower() != PREF_AUTO and not any(
+            key == current for _label, key in self._browser_options
+        ):
+            label = f"手动指定：{os.path.basename(current)}" if os.sep in current else current
+            self._browser_options.append((label, current))
+
+        self._browser_combo['values'] = [label for label, _key in self._browser_options]
+        index = next(
+            (i for i, (_label, key) in enumerate(self._browser_options) if key == current), 0
+        )
+        self._browser_combo.current(index)
+        self._browser_value = self._browser_options[index][1]
+
+    def _on_browser_selected(self, _event=None):
+        index = self._browser_combo.current()
+        if 0 <= index < len(self._browser_options):
+            self._browser_value = self._browser_options[index][1]
+
+    def _pick_browser(self):
+        path = filedialog.askopenfilename(
+            title="选择 Chromium 内核浏览器",
+            filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        self._browser_value = path
+        self._refresh_browser_combo()
+        messagebox.showinfo("已选择浏览器", f"刷课时将使用：\n{path}")
 
     # ── 刷课控制 ──────────────────────────────────────────────────────────────
     def _start(self):
@@ -283,8 +345,14 @@ class App(tk.Tk):
             messagebox.showwarning("提示", "请至少设置一个大于 0 的目标学时（必修或选修）。")
             return
 
+        browser_desc = (
+            "自动检测"
+            if (self._browser_value or '').lower() == PREF_AUTO
+            else self._browser_value
+        )
         self._append_log(
             f">>> 开始刷课，用户：{user['name']}；目标：必修 {m_target} / 选修 {o_target}\n"
+            f">>> 浏览器：{browser_desc}\n"
         )
         self._start_btn.config(state='disabled')
         self._stop_btn.config(state='normal')
@@ -297,6 +365,7 @@ class App(tk.Tk):
                 optional_target=o_target,
                 log_cb=lambda msg: self._log_queue.put(msg),
                 progress_cb=lambda m, o: self._log_queue.put(f"__PROGRESS__|{m}|{o}"),
+                browser_pref=self._browser_value or PREF_AUTO,
             )
             try:
                 asyncio.run(self._shuake.start())

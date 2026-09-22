@@ -1,4 +1,5 @@
 from playwright.async_api import async_playwright
+from browser_launcher import launch_chromium
 from getcourseid import Get_course_id
 import asyncio
 import random
@@ -29,6 +30,7 @@ class Shuake:
         optional_target: float,
         log_cb=None,
         progress_cb=None,
+        browser_pref: str | None = None,
     ):
         """
         user: {"name": str, "username": str, "password": str}
@@ -36,10 +38,13 @@ class Shuake:
         optional_target: 目标选修学时（<=0 表示不刷选修）
         log_cb: 日志回调函数 log_cb(str)，不传则 fallback 到 print
         progress_cb: 学时进度回调 progress_cb(mandatory: float, optional: float)
+        browser_pref: 浏览器选择，None / "auto" 为自动探测，
+                      也可以是 Playwright channel 名（chrome、msedge）或浏览器 exe 路径
         """
         self.user = user
         self.mandatory_target = float(mandatory_target or 0)
         self.optional_target = float(optional_target or 0)
+        self.browser_pref = browser_pref
         self._log = log_cb if log_cb else print
         self._progress_cb = progress_cb
         self._stop = False
@@ -53,11 +58,15 @@ class Shuake:
     # ── 主流程 ────────────────────────────────────────────────────────────────
     async def start(self):
         async with async_playwright() as playwright:
-            self.browser = await playwright.chromium.launch(
-                channel='chrome', headless=False, args=['--mute-audio']
+            self._launched = await launch_chromium(
+                playwright,
+                preferred=self.browser_pref,
+                headless=False,
+                args=['--mute-audio'],
+                log=self.log,
             )
-            self.context = await self.browser.new_context()
-            self.page = await self.context.new_page()
+            self.browser = self._launched.browser
+            self.context, self.page = await self._launched.open_page()
 
             try:
                 await self._goto_with_retry("https://bjce.bjdj.gov.cn/#/")
@@ -66,7 +75,7 @@ class Shuake:
                 await self._main_loop()
             finally:
                 try:
-                    await self.browser.close()
+                    await self._launched.close()
                 except Exception:
                     pass
 
@@ -219,16 +228,59 @@ class Shuake:
         return mandatory, optional
 
     # ── 刷课（每次只刷一门后返回，由外层决定切换） ────────────────────────────
+    async def _client_fingerprint(self) -> dict:
+        """采集真实浏览器指纹，供 aiohttp 接口请求复用。
+
+        以前请求头里写死了 Chrome / Edge 的 UA 与客户端提示，换成别的 Chromium
+        内核后会出现"请求头品牌和真实内核不一致"的矛盾，这里改为直接读浏览器。
+        """
+        info: dict = {}
+        try:
+            info = await self.page.evaluate(
+                """() => {
+                    const d = navigator.userAgentData;
+                    return {
+                        userAgent: navigator.userAgent,
+                        brands: d ? d.brands.map(b => b.brand + ';v=' + b.version) : [],
+                        platform: d ? d.platform : (navigator.platform || ''),
+                        mobile: d ? !!d.mobile : false,
+                    };
+                }"""
+            )
+        except Exception as e:
+            self.log(f"读取浏览器指纹失败（将沿用默认请求头）：{e}")
+
+        try:
+            cookies = await self.context.cookies()
+        except Exception:
+            cookies = []
+        xsrf = next(
+            (c.get("value") for c in cookies if (c.get("name") or "").lower() == "xsrf-token"),
+            "",
+        )
+
+        brands = info.get("brands") or []
+        return {
+            "user_agent": info.get("userAgent"),
+            "sec_ch_ua": ", ".join(f'"{item}"' for item in brands) or None,
+            "platform": info.get("platform") or None,
+            "mobile": bool(info.get("mobile")),
+            "xsrf_token": xsrf or None,
+        }
+
     async def _get_course_link(self, url: str, channel_id: str):
         await self._goto_with_retry(url)
         cookies = await self.context.cookies()
-        cookies = '; '.join([f"{cookie['name']}={cookie['value']}" for cookie in cookies])
+        cookie_header = '; '.join([f"{cookie['name']}={cookie['value']}" for cookie in cookies])
+        client = await self._client_fingerprint()
 
         container = await self.page.wait_for_selector('div.iv-template-every > ul', timeout=30000)
         course_items = await container.query_selector_all('li[data-v-d50a91fc]')
         rowlength = len(course_items)
 
-        uncompleted_courses = await Get_course_id(cookies, channel_id, rowlength, 1)
+        uncompleted_courses = await Get_course_id(
+            cookie_header, channel_id, rowlength, 1, client=client
+        )
         return uncompleted_courses
 
     async def _run_one_course(self, url: str, channel_id: str):

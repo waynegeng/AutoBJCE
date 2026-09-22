@@ -1,6 +1,7 @@
 ﻿dist/
 install/
-installer/
+installer/Output/
 build_work/
 __pycache__/
+config.json
 *.pyc

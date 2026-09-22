@@ -37,14 +37,42 @@ BASE_PARAMS = {
 }
 
 
-async def Get_course_id(cookie: str, search_category: str, page_size: int, current_page: int):
+async def Get_course_id(
+    cookie: str,
+    search_category: str,
+    page_size: int,
+    current_page: int,
+    client: dict | None = None,
+):
     """
     根据传入的 cookie、专题ID（search_category）、每页条数和当前页码，从接口获取课程列表数据。
     获取课程的基本信息，包括 courseID、courseName、setType 等字段。
+
+    client: 可选，真实浏览器指纹，来自 Shuake._client_fingerprint()：
+            {"user_agent": str, "sec_ch_ua": str, "platform": str,
+             "mobile": bool, "xsrf_token": str}
+            传入后会覆盖 NEW_HEADERS 里写死的 UA / 客户端提示 / XSRF，
+            使请求头与当前实际使用的 Chromium 内核保持一致。
+            不传时行为与旧版一致（使用文件内的默认值）。
     """
     headers = NEW_HEADERS.copy()
     # 将 cookie 填入 headers 内，注意必须包含所有有效的 Cookie 字段
     headers['cookie'] = cookie
+
+    if client:
+        user_agent = client.get("user_agent")
+        if user_agent:
+            headers['user-agent'] = user_agent
+        sec_ch_ua = client.get("sec_ch_ua")
+        if sec_ch_ua:
+            headers['sec-ch-ua'] = sec_ch_ua
+        platform = client.get("platform")
+        if platform:
+            headers['sec-ch-ua-platform'] = f'"{platform}"'
+        headers['sec-ch-ua-mobile'] = '?1' if client.get("mobile") else '?0'
+        xsrf_token = client.get("xsrf_token")
+        if xsrf_token:
+            headers['x-xsrf-token'] = xsrf_token
 
     # 更新查询参数
     params = BASE_PARAMS.copy()

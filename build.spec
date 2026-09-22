@@ -24,6 +24,10 @@ a = Analysis(
         'playwright',
         'playwright.async_api',
         'playwright._impl._driver',
+        # 浏览器探测 / 启动封装
+        'browser_launcher',
+        # 浏览器探测用到的注册表读取（避免被误裁）
+        'winreg',
         # 真正用到的网络库
         'aiohttp',
     ],
