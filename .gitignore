@@ -1,7 +1,10 @@
-﻿dist/
+dist/
 install/
 installer/Output/
 build_work/
 __pycache__/
 config.json
 *.pyc
+
+# 登录信息（Chromium 持久化用户目录，含账号凭据）——绝对不要提交
+userdata/

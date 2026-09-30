@@ -25,26 +25,33 @@ class NoRemainingCourseError(Exception):
 class Shuake:
     def __init__(
         self,
-        user: dict,
-        mandatory_target: float,
-        optional_target: float,
+        user: dict | None = None,
+        mandatory_target: float = 0,
+        optional_target: float = 0,
         log_cb=None,
         progress_cb=None,
         browser_pref: str | None = None,
+        session=None,
+        login_timeout_sec: float = 180.0,
     ):
         """
-        user: {"name": str, "username": str, "password": str}
+        user: {"name": str, ...} 仅用于日志展示；登录态由 session / 浏览器决定
         mandatory_target: 目标必修学时（<=0 表示不刷必修）
         optional_target: 目标选修学时（<=0 表示不刷选修）
         log_cb: 日志回调函数 log_cb(str)，不传则 fallback 到 print
         progress_cb: 学时进度回调 progress_cb(mandatory: float, optional: float)
         browser_pref: 浏览器选择，None / "auto" 为自动探测，
                       也可以是 Playwright channel 名（chrome、msedge）或浏览器 exe 路径
+        session: 已登录的 :class:`login.LoginSession`（由登录模块提供）。
+                 传入时直接复用该浏览器窗口，不再自己启动浏览器、也不再尝试自动登录。
+        login_timeout_sec: 未登录时等待用户手动登录的时长
         """
-        self.user = user
+        self.user = user or {}
         self.mandatory_target = float(mandatory_target or 0)
         self.optional_target = float(optional_target or 0)
         self.browser_pref = browser_pref
+        self.session = session
+        self.login_timeout_sec = float(login_timeout_sec or 0)
         self._log = log_cb if log_cb else print
         self._progress_cb = progress_cb
         self._stop = False
@@ -57,6 +64,21 @@ class Shuake:
 
     # ── 主流程 ────────────────────────────────────────────────────────────────
     async def start(self):
+        if self.session is not None:
+            # 复用登录模块打开的窗口：登录态保存在持久化用户目录里
+            self._launched = None
+            self.context = self.session.context
+            self.page = self.session.page
+            try:
+                await self._wait_home_ready()
+                await self._wait_login_ready(timeout_ms=int(self.login_timeout_sec * 1000))
+                await self._main_loop()
+            finally:
+                # 窗口与登录态交给登录模块管理，这里不关闭浏览器
+                pass
+            return
+
+        # 未提供 session：自行启动一个临时浏览器（兼容旧用法 / 命令行调用）
         async with async_playwright() as playwright:
             self._launched = await launch_chromium(
                 playwright,
@@ -70,14 +92,23 @@ class Shuake:
 
             try:
                 await self._goto_with_retry("https://bjce.bjdj.gov.cn/#/")
-                await self.login()
-                await self._wait_login_ready(timeout_ms=180000)
+                await self._wait_login_ready(timeout_ms=LOGIN_TIMEOUT_MS)
                 await self._main_loop()
             finally:
                 try:
                     await self._launched.close()
                 except Exception:
                     pass
+
+    async def _wait_home_ready(self):
+        """确保当前页面在首页（登录模块可能停在登录弹窗或其它路由）。"""
+        try:
+            if "bjce.bjdj.gov.cn" not in (self.page.url or ""):
+                await self._goto_with_retry("https://bjce.bjdj.gov.cn/#/")
+        except Exception as exc:
+            self.log(f"打开首页失败，稍后重试：{exc}")
+        # 等标签页选择器生效，避免刷课开始时正好还在切换窗口
+        await asyncio.sleep(1.5)
 
     async def _main_loop(self):
         """按目标学时在必修/选修之间自动切换，直到两类均达标或用户停止。"""
@@ -140,22 +171,59 @@ class Shuake:
 
     # ── 登录 / 页面就绪 ───────────────────────────────────────────────────────
     async def _wait_login_ready(self, timeout_ms: int = 180000):
+        """等待页面进入已登录状态。
+
+        判定顺序：
+        1. 学时区域 ``div.iv-row-left-bottom-div2`` 出现（已登录首页特征）；
+        2. 站内"当前用户"接口返回有效用户（兼容页面结构变化）。
+        未登录时给出提示，等待用户在浏览器窗口中手动完成登录（扫码 / 账号密码）。
+        """
         start = time.time()
+        notice_at = 0.0
+        captcha_noticed = False
         while (time.time() - start) * 1000 < timeout_ms:
-            # 已登录后首页会出现学时区域
             score_block = await self.page.query_selector("div.iv-row-left-bottom-div2")
             if score_block:
                 return
 
-            # 验证码场景：提示用户手动完成
+            if await self._page_logged_in():
+                return
+
             captcha_input = await self.page.query_selector('input[placeholder*="验证码"]')
             captcha_img = await self.page.query_selector("img[src*='captcha'], img[alt*='验证码']")
-            if captcha_input or captcha_img:
+            if (captcha_input or captcha_img) and not captcha_noticed:
                 self.log("检测到验证码，请在浏览器中手动完成验证码后继续。")
+                captcha_noticed = True
+
+            if time.time() - start > 15 and time.time() - notice_at > 60:
+                self.log("尚未登录：请在已打开的浏览器窗口中扫码或输入账号密码完成登录，程序会自动继续。")
+                notice_at = time.time()
 
             await asyncio.sleep(2)
 
-        raise TimeoutError(f"登录后页面未就绪，等待超时({timeout_ms}ms)")
+        raise TimeoutError("等待登录超时，请重新登录后再开始刷课。")
+
+    async def _page_logged_in(self) -> bool:
+        """用站内接口判断当前页面是否已登录（不依赖具体 DOM 结构）。"""
+        try:
+            result = await self.page.evaluate(
+                """async () => {
+                    try {
+                        const r = await fetch('/api-ouser/portal/user/getCurrentUser?lang=zh_CN', {
+                            headers: {accept: 'application/json, text/plain, */*', terminal: 'pc'},
+                            credentials: 'include',
+                            cache: 'no-store',
+                        });
+                        if (!r.ok) return false;
+                        const j = await r.json();
+                        const d = (j && j.data) || {};
+                        return !!(d.name || d.userName);
+                    } catch (e) { return false; }
+                }"""
+            )
+            return bool(result)
+        except Exception:
+            return False
 
     async def _goto_with_retry(self, url: str):
         try:
@@ -166,8 +234,19 @@ class Shuake:
         await self.page.goto(url, timeout=90000, wait_until="domcontentloaded")
 
     async def login(self):
-        selected_user = self.user
-        self.log(f"正在登录用户：{selected_user['name']}")
+        """兼容旧流程：按账号密码自动登录。
+
+        注意：新的登录模块走"用户手动登录 + 持久化用户目录"，
+        正常不会再调用这里；仅在直接使用 :class:`Shuake` 且传入了
+        ``user['username']`` / ``user['password']`` 时才会尝试。
+        """
+        selected_user = self.user or {}
+        username = (selected_user.get("username") or "").strip()
+        password = (selected_user.get("password") or "").strip()
+        if not username or not password:
+            raise ValueError("未提供账号密码；请先在界面上完成登录，或补全账号信息。")
+
+        self.log(f"正在登录用户：{selected_user.get('name') or username}")
 
         try:
             await self.page.wait_for_load_state('domcontentloaded')
@@ -182,21 +261,21 @@ class Shuake:
 
             username_input = await self.page.wait_for_selector('[placeholder="请输入账号"]', timeout=LOGIN_TIMEOUT_MS)
             if username_input:
-                await username_input.fill(selected_user["username"])
+                await username_input.fill(username)
             else:
                 self.log("用户名输入框未找到，请检查选择器。")
                 return
 
             password_input = await self.page.wait_for_selector('[placeholder="请输入密码"]', timeout=LOGIN_TIMEOUT_MS)
             if password_input:
-                await password_input.fill(selected_user["password"])
+                await password_input.fill(password)
             else:
                 self.log("密码输入框未找到，请检查选择器。")
                 return
 
             wxlogin_button = await self.page.wait_for_selector('//span[text()="微信认证登录"]', timeout=LOGIN_TIMEOUT_MS)
             await wxlogin_button.click()
-            self.log(f"用户 {selected_user['name']} 登录成功！")
+            self.log(f"用户 {selected_user.get('name') or username} 登录成功！")
 
         except Exception as e:
             self.log(f"登录过程中发生错误：{e}")

@@ -1,5 +1,5 @@
 #define AppName "AutoBJCE"
-#define AppVersion "2.2"
+#define AppVersion "2.3"
 #define AppPublisher "AutoBJCE"
 #define AppExeName "AutoBJCE.exe"
 
@@ -11,7 +11,7 @@ AppPublisher={#AppPublisher}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 OutputDir=Output
-OutputBaseFilename=AutoBJCE2.2-Setup
+OutputBaseFilename=AutoBJCE2.3-Setup
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern

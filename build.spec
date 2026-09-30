@@ -26,6 +26,11 @@ a = Analysis(
         'playwright._impl._driver',
         # 浏览器探测 / 启动封装
         'browser_launcher',
+        # 登录会话管理与配置（界面按需 import，避免被误裁）
+        'login',
+        'app_config',
+        'Shuake',
+        'getcourseid',
         # 浏览器探测用到的注册表读取（避免被误裁）
         'winreg',
         # 真正用到的网络库

@@ -294,8 +294,15 @@ class LaunchedBrowser:
     name: str
     mode: str  # "pipe" | "cdp"
     exe_path: str | None = None
+    context: Any = None  # 持久化用户目录模式下由 launch_persistent_context 直接给出
+    user_data_dir: str | None = None  # 持久化用户目录（登录状态保存在这里）
     _process: subprocess.Popen | None = None
-    _profile_dir: str | None = None
+    _profile_dir: str | None = None  # 仅"调试端口接管"创建的临时目录
+
+    @property
+    def persistent(self) -> bool:
+        """是否使用持久化用户目录（登录态可跨次打开复用）。"""
+        return bool(self.user_data_dir)
 
     async def open_page(self, **context_kwargs: Any) -> tuple[Any, Any]:
         """创建上下文与首个页面，返回 (context, page)。
@@ -303,15 +310,19 @@ class LaunchedBrowser:
         CDP 模式下浏览器启动时会自带一个空白标签页，必须"先建新页、再清理旧页"，
         否则有头模式关掉最后一个标签页会连同窗口一起关掉，后续无法再开新标签。
         """
-        if self.mode == "cdp":
+        if self.context is not None:
+            # 持久化用户目录：上下文由浏览器启动时创建，直接复用
+            context = self.context
+        elif self.mode == "cdp":
             contexts = list(getattr(self.browser, "contexts", []) or [])
             context = contexts[0] if contexts else await self.browser.new_context(**context_kwargs)
         else:
             context = await self.browser.new_context(**context_kwargs)
 
+        self.context = context
         page = await context.new_page()
 
-        if self.mode == "cdp":
+        if self.mode == "cdp" or self.persistent:
             await _close_placeholder_pages(context, keep=page)
         return context, page
 
@@ -322,6 +333,7 @@ class LaunchedBrowser:
             pass
         _terminate(self._process)
         if self._profile_dir:
+            # 只删临时目录；用户目录（user_data_dir）必须保留，登录态就在里面
             _remove_profile(self._profile_dir)
 
 
@@ -332,13 +344,22 @@ async def launch_chromium(
     headless: bool = False,
     args: list[str] | None = None,
     log: Callable[[str], None] | None = None,
+    user_data_dir: str | None = None,
 ) -> LaunchedBrowser:
-    """启动任意可用的 Chromium 内核浏览器，返回统一句柄。"""
+    """启动任意可用的 Chromium 内核浏览器，返回统一句柄。
+
+    user_data_dir 不为空时使用"持久化用户目录"启动（``launch_persistent_context``），
+    浏览器 cookie / localStorage 会落盘到该目录，登录状态可跨进程复用；
+    此时不使用 Playwright 自带的临时 Chromium，必须落到本机真实浏览器。
+    """
     say = log or print
     launch_args = list(args or [])
-    explicit, candidates = plan_candidates(
-        preferred, bundled_exe=getattr(playwright.chromium, "executable_path", None), log=say
-    )
+    persistent_dir = os.path.abspath(user_data_dir) if user_data_dir else None
+    if persistent_dir:
+        os.makedirs(persistent_dir, exist_ok=True)
+
+    bundled_exe = None if persistent_dir else getattr(playwright.chromium, "executable_path", None)
+    explicit, candidates = plan_candidates(preferred, bundled_exe=bundled_exe, log=say)
     if explicit:
         say(f"[浏览器] 按界面 / 配置指定：{explicit.label}")
     if not candidates:
@@ -348,12 +369,18 @@ async def launch_chromium(
         )
 
     say(f"[浏览器] 待尝试的候选：{' → '.join(b.name for b in candidates)}")
+    if persistent_dir:
+        say(f"[浏览器] 登录状态保存目录：{persistent_dir}")
 
     failures: list[str] = []
     for index, browser in enumerate(candidates):
         try:
-            launched = await playwright.chromium.launch(
-                headless=headless, args=launch_args, **browser.launch_kwargs()
+            launched = await _launch_once(
+                playwright,
+                browser,
+                headless=headless,
+                args=launch_args,
+                user_data_dir=persistent_dir,
             )
         except Exception as exc:
             failures.append(f"{browser.label}: {_brief(exc)}")
@@ -363,16 +390,19 @@ async def launch_chromium(
                 say("[浏览器] 已启动 Playwright 内置 Chromium。")
             else:
                 say(f"[浏览器] 已启动 {browser.label}。")
-            return LaunchedBrowser(
-                browser=launched, name=browser.name, mode="pipe", exe_path=browser.exe_path
-            )
+            return launched
 
         # 管道启动失败 → 同一浏览器改用调试端口 + CDP 接管
         if browser.exe_path:
             say(f"[浏览器] 尝试用调试端口方式接管 {browser.name} …")
             try:
                 return await _launch_via_port(
-                    playwright, browser, headless=headless, args=launch_args, log=say
+                    playwright,
+                    browser,
+                    headless=headless,
+                    args=launch_args,
+                    log=say,
+                    user_data_dir=persistent_dir,
                 )
             except Exception as exc:
                 failures.append(f"{browser.name}（调试端口）: {_brief(exc)}")
@@ -387,6 +417,44 @@ async def launch_chromium(
     )
 
 
+async def _launch_once(
+    playwright: Any,
+    browser: Browser,
+    *,
+    headless: bool,
+    args: list[str],
+    user_data_dir: str | None,
+) -> LaunchedBrowser:
+    """普通启动（临时上下文）或持久化用户目录启动。"""
+    kwargs = browser.launch_kwargs()
+
+    if not user_data_dir:
+        launched = await playwright.chromium.launch(headless=headless, args=args, **kwargs)
+        return LaunchedBrowser(
+            browser=launched, name=browser.name, mode="pipe", exe_path=browser.exe_path
+        )
+
+    # 持久化目录 + Playwright channel：channel 会强制 usePersistentContext
+    # （否则某些内核下会忽略 user-data-dir 另开临时目录）
+    if browser.channel:
+        kwargs["channel"] = browser.channel
+    context = await playwright.chromium.launch_persistent_context(
+        user_data_dir,
+        headless=headless,
+        args=args,
+        viewport={"width": 1440, "height": 900},
+        **kwargs,
+    )
+    return LaunchedBrowser(
+        browser=context.browser,
+        context=context,
+        name=browser.name,
+        mode="pipe",
+        exe_path=browser.exe_path,
+        user_data_dir=user_data_dir,
+    )
+
+
 async def _launch_via_port(
     playwright: Any,
     browser: Browser,
@@ -394,13 +462,18 @@ async def _launch_via_port(
     headless: bool,
     args: list[str],
     log: Callable[[str], None],
+    user_data_dir: str | None = None,
 ) -> LaunchedBrowser:
-    """以 --remote-debugging-port 启动浏览器，再用 CDP 接管。"""
+    """以 --remote-debugging-port 启动浏览器，再用 CDP 接管。
+
+    传入 user_data_dir 时直接使用该目录（登录态落盘），否则建临时目录并在关闭时清理。
+    """
     exe = browser.exe_path
     if not exe:
         raise RuntimeError("未解析到浏览器可执行文件路径")
 
-    profile_dir = tempfile.mkdtemp(prefix="autobjce-cdp-")
+    persistent_dir = os.path.abspath(user_data_dir) if user_data_dir else None
+    profile_dir = persistent_dir or tempfile.mkdtemp(prefix="autobjce-cdp-")
     command = [
         exe,
         f"--user-data-dir={profile_dir}",
@@ -417,7 +490,8 @@ async def _launch_via_port(
     try:
         process = subprocess.Popen(command, creationflags=creation_flags, close_fds=True)
     except Exception:
-        _remove_profile(profile_dir)
+        if not persistent_dir:
+            _remove_profile(profile_dir)
         raise
 
     try:
@@ -427,7 +501,8 @@ async def _launch_via_port(
         )
     except Exception:
         _terminate(process)
-        _remove_profile(profile_dir)
+        if not persistent_dir:
+            _remove_profile(profile_dir)
         raise
 
     log(f"[浏览器] 已通过调试端口 {port} 接管 {browser.name}。")
@@ -436,8 +511,10 @@ async def _launch_via_port(
         name=browser.name,
         mode="cdp",
         exe_path=exe,
+        user_data_dir=persistent_dir,
         _process=process,
-        _profile_dir=profile_dir,
+        # 持久化目录不参与关闭清理，这里只记录临时目录
+        _profile_dir=None if persistent_dir else profile_dir,
     )
 
 
