@@ -111,22 +111,51 @@ def save_config(cfg: dict, path: str | None = None, env_path: str | None = None)
 
 
 def account_view(account_id: str, user_data_dir: str | None = None) -> dict:
-    """账号行要展示的内容：登录名、状态文案、配色、按钮文案。"""
+    """账号行要展示的内容：状态文案 + **唯一一个**按钮。
+
+    每行只给一个按钮，用户不需要理解"打开窗口 / 校验 / 切换"这些操作：
+
+    - 已登录 → 按钮是「退出登录」（想换人时点它）
+    - 未登录 → 按钮是「去登录」/「登录 · 换账号」，点一下就完成
+      （能复用已保存的登录态就直接进，否则打开浏览器等扫码）
+
+    状态文案带「账号N」前缀——界面上没有单独的槽位列，靠这一句分清是哪一行。
+    """
     meta = read_profile_meta(account_id, user_data_dir)
     name = display_name(meta)
     state = meta.get('state')
+    remembered = meta.get('accounts') or []
+    try:
+        slot = f"账号{ACCOUNT_IDS.index(account_id) + 1}"
+    except ValueError:
+        slot = account_id
 
     if state == 'expired':
-        return {"meta": meta, "name": name, "text": "登录信息已失效，需重新登录",
-                "color": COLOR_BAD, "button": "去登录", "logged_in": False}
-    if name:
-        return {"meta": meta, "name": name, "text": f"当前登录：{name}",
-                "color": COLOR_OK, "button": "切换账号", "logged_in": True}
-    if state == 'saved':
-        return {"meta": meta, "name": name, "text": "已保存登录信息（待校验）",
-                "color": COLOR_WARN, "button": "去登录", "logged_in": False}
-    if state == 'error':
-        return {"meta": meta, "name": name, "text": "登录信息读取失败，建议重新登录",
-                "color": COLOR_BAD, "button": "去登录", "logged_in": False}
-    return {"meta": meta, "name": name, "text": "未登录",
-            "color": COLOR_IDLE, "button": "去登录", "logged_in": False}
+        detail, color, button, logged_in = "登录信息已失效，点右侧重新登录", COLOR_BAD, "重新登录", False
+        action = "login"
+    elif name:
+        detail, color, button, logged_in = f"当前登录：{name}", COLOR_OK, "退出登录", True
+        action = "logout"
+    elif remembered:
+        who = display_name(remembered[0]) or "上次的账号"
+        detail = f"未登录（可直接登录 {who}）"
+        color, button, logged_in, action = COLOR_WARN, "登录 · 换账号", False, "login"
+    elif state == 'error':
+        detail, color, button, logged_in = "登录信息读取失败，点右侧重新登录", COLOR_BAD, "重新登录", False
+        action = "login"
+    else:
+        detail, color, button, logged_in = "未登录", COLOR_IDLE, "去登录", False
+        action = "login"
+
+    return {
+        "meta": meta,
+        "name": name,
+        "slot": slot,
+        "text": f"{slot} · {detail}",
+        "detail": detail,
+        "color": color,
+        "button": button,
+        "action": action,
+        "logged_in": logged_in,
+        "remembered": len(remembered),
+    }

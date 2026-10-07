@@ -8,10 +8,14 @@
    （在页面上下文里发起，自动带上 cookie 与 XSRF 头），接口返回的
    ``data.name`` 是用户姓名，``data.userName`` 是登录账号名，另有 ``headImg``。
    接口拿不到时依次回退到 localStorage / sessionStorage、页面 DOM。
-3. **保存登录信息**：每个账号使用独立的 Chromium **持久化用户目录**
+3. **保存登录信息**：每个槽位使用独立的 Chromium **持久化用户目录**
    （``userdata/profiles/account-N``）。cookie / localStorage 都落盘在该目录，
    下次启动程序可以直接复用，无需重新扫码；账号名等摘要另存
    ``userdata/profiles/account-N/profile.json`` 便于界面快速展示。
+4. **登录态快照**：站点的登录凭据在 Cookie 里，而"切换账号"是在同一个用户目录里
+   退出旧账号（清 Cookie），旧凭据就此消失。因此退出前会把 cookie 另存一份
+   ``auth_state.json`` 快照；切回来时若目录里已无凭据，就用快照恢复，
+   不必重新扫码。真正换了人（登录名不同）则立即删除旧快照，避免串号。
 
 本模块只负责"浏览器 + 登录态"，刷课逻辑在 :mod:`Shuake`。
 """
@@ -21,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from typing import Any, Callable
@@ -33,13 +38,18 @@ LOGIN_BTN_TEXT = "请登录"
 # 站内"当前用户"接口（相对当前 origin）
 CURRENT_USER_PATH = "/api-ouser/portal/user/getCurrentUser?lang=zh_CN"
 
-# 账号槽位（界面最多 3 个）
-ACCOUNT_IDS = ("account-1", "account-2", "account-3")
+# 账号槽位（界面上一个槽位保存一份登录信息）
+ACCOUNT_IDS = (
+    "account-1", "account-2", "account-3",
+    "account-4", "account-5", "account-6",
+)
 
 # 等待用户手动完成登录的时长（秒）
 LOGIN_WAIT_SEC = 900
 # 校验已保存登录态的单次探测超时（秒）
 VALIDATE_TIMEOUT_SEC = 60
+# 每个槽位最多记住几个登录过的账号（保留各自登录态快照）
+MAX_REMEMBERED_ACCOUNTS = 5
 
 
 class LoginRequiredError(Exception):
@@ -77,6 +87,70 @@ def _meta_path(account_id: str, user_data_dir: str | None = None) -> str:
     return os.path.join(profile_dir(account_id, user_data_dir), "profile.json")
 
 
+def _state_path(account_id: str, user_data_dir: str | None = None) -> str:
+    """登录态快照文件（Playwright storage_state：cookies + localStorage）。
+
+    为什么要额外存这份快照：站点的登录态存在 Cookie 里，而"切换账号"是在**同一个
+    用户目录**里退出旧账号（清 Cookie），旧账号凭据就此消失，切回来自然未登录。
+    有了快照，切回来时可以把 Cookie 重新灌回去，不必再扫一次码。
+    """
+    return os.path.join(profile_dir(account_id, user_data_dir), "auth_state.json")
+
+
+def _person_key(user: dict | None) -> str:
+    """同一个人可能有姓名和登录账号两种写法，取一个稳定的键。"""
+    if not user:
+        return ""
+    for field in ("userName", "name"):
+        value = (user.get(field) or "").strip()
+        if value:
+            return value.lower()
+    return ""
+
+
+def _same_person(a: dict | None, b: dict | None) -> bool:
+    """判断两个用户信息是否指向同一个人。"""
+    keys_a = {
+        (a.get(f) or "").strip().lower()
+        for f in ("name", "userName")
+        if (a.get(f) or "").strip()
+    }
+    keys_b = {
+        (b.get(f) or "").strip().lower()
+        for f in ("name", "userName")
+        if (b.get(f) or "").strip()
+    }
+    return bool(keys_a & keys_b)
+
+
+def _person_state_path(
+    account_id: str, person: dict | None, user_data_dir: str | None = None
+) -> str:
+    """按人头存的登录态快照：`auth_state.<登录账号>.json`。
+
+    同一个槽位换过几个人就有几份快照，互不覆盖，切回谁都能直接复用。
+    """
+    key = re.sub(r"[^0-9A-Za-z_\-]", "_", _person_key(person or ""))
+    if not key:
+        return ""
+    return os.path.join(profile_dir(account_id, user_data_dir), f"auth_state.{key}.json")
+
+
+def _all_state_paths(account_id: str, user_data_dir: str | None = None) -> list[str]:
+    """该槽位下所有登录态快照（含旧版单文件命名）。"""
+    directory = profile_dir(account_id, user_data_dir)
+    paths = [_state_path(account_id, user_data_dir)]
+    try:
+        for entry in os.listdir(directory):
+            if entry.startswith("auth_state.") and entry.endswith(".json"):
+                full = os.path.join(directory, entry)
+                if full not in paths:
+                    paths.append(full)
+    except Exception:
+        pass
+    return paths
+
+
 def _marker_path(account_id: str, user_data_dir: str | None = None) -> str:
     """标记文件：该账号至少打开过一次浏览器窗口。
 
@@ -100,9 +174,11 @@ def _touch_marker(account_id: str, user_data_dir: str | None = None) -> None:
 def read_profile_meta(account_id: str, user_data_dir: str | None = None) -> dict:
     """读取账号的登录信息摘要（纯文件读取，任何线程都可安全调用）。
 
-    返回形如 ``{"state", "name", "userName", "headImg", "last_login", "profile_dir"}``：
+    返回形如 ``{"state", "name", "userName", "headImg", "last_login", "accounts"}``：
     - state: ``none``（未登录 / 已退出） / ``saved``（有登录信息，未校验） /
       ``valid``（校验或登录通过） / ``expired``（校验发现已失效） / ``error``（摘要损坏）
+    - accounts: 这个槽位登录过的账号列表（``[{"name", "userName", "last_login"}]``），
+      换人时保留——同一个人切回来仍可复用它的登录态快照。
     """
     meta: dict = {
         "account_id": account_id,
@@ -111,6 +187,8 @@ def read_profile_meta(account_id: str, user_data_dir: str | None = None) -> dict
         "userName": "",
         "headImg": "",
         "last_login": 0,
+        "accounts": [],
+        "logged_out": False,
         "profile_dir": profile_dir(account_id, user_data_dir),
     }
     path = _meta_path(account_id, user_data_dir)
@@ -122,7 +200,15 @@ def read_profile_meta(account_id: str, user_data_dir: str | None = None) -> dict
                 for key in ("state", "name", "userName", "headImg", "last_login"):
                     if saved.get(key):
                         meta[key] = saved[key]
-            if meta.get("name") or meta.get("userName"):
+                if isinstance(saved.get("accounts"), list):
+                    meta["accounts"] = [a for a in saved["accounts"] if isinstance(a, dict)]
+                meta["logged_out"] = bool(saved.get("logged_out"))
+            if meta["logged_out"]:
+                # 已主动退出登录：历史账号还留着，但当前是未登录
+                meta["state"] = "none"
+                meta["name"] = ""
+                meta["userName"] = ""
+            elif meta.get("name") or meta.get("userName"):
                 # 摘要是"上次登录时"记录的，是否还有效由界面触发校验
                 if meta.get("state") == "none":
                     meta["state"] = "saved"
@@ -132,21 +218,64 @@ def read_profile_meta(account_id: str, user_data_dir: str | None = None) -> dict
         # 用过这个账号目录，但没有登录摘要 → 已退出登录 / 上次没登录成功
         meta["state"] = "none"
     elif os.path.isdir(meta["profile_dir"]):
-        # 目录存在但没有标记文件（老版本目录，或标记文件被清掉）
-        meta["state"] = "saved"
+        # 只有残留的浏览器目录、没有摘要也没有标记（老版本目录，或标记被清掉）。
+        # 里面可能还留着 Cookie，但无法确认身份，按"未登录"处理，
+        # 让用户点一次登录按钮（会先尝试复用，能用就直接进去）。
+        meta["state"] = "none"
+    return meta
+
+
+def profile_accounts(account_id: str, user_data_dir: str | None = None) -> list[dict]:
+    """某个槽位历史登录过的账号（最近登录的在前）。"""
+    return read_profile_meta(account_id, user_data_dir).get("accounts") or []
+
+
+def mark_logged_out(account_id: str, user_data_dir: str | None = None) -> dict:
+    """把槽位标记为"已退出登录"。
+
+    只改状态，**保留历史账号与其登录态快照**——这样以后想再用谁，
+    点一下登录按钮就能直接复用，不必重新扫码。
+    """
+    meta = read_profile_meta(account_id, user_data_dir)
+    meta.update({"state": "none", "name": "", "userName": "", "headImg": "", "logged_out": True})
+    path = _meta_path(account_id, user_data_dir)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, ensure_ascii=False, indent=2)
+        _touch_marker(account_id, user_data_dir)
+    except Exception:
+        pass
     return meta
 
 
 def write_profile_meta(account_id: str, user: dict, user_data_dir: str | None = None) -> dict:
-    """把登录成功后的用户信息写入摘要文件。"""
+    """记录"这个槽位当前是谁"，并把该账号并入历史列表。
+
+    历史列表用于判断"换回来的是不是原来那个人"：同一个人登录时不要删掉它的
+    登录态快照（快照文件名带账号名），换人时也要保留旧快照，以便切回去。
+    """
     meta = read_profile_meta(account_id, user_data_dir)
+    name = (user.get("name") or "").strip()
+    username = (user.get("userName") or "").strip()
+    now = int(time.time())
+
+    history = [
+        a for a in meta.get("accounts") or []
+        if not _same_person(a, {"name": name, "userName": username})
+    ]
+    history.insert(0, {"name": name, "userName": username, "last_login": now})
+
     meta.update(
         {
             "state": "valid",
-            "name": (user.get("name") or "").strip(),
-            "userName": (user.get("userName") or "").strip(),
+            "name": name,
+            "userName": username,
             "headImg": user.get("headImg") or "",
-            "last_login": int(time.time()),
+            "last_login": now,
+            "accounts": history[:MAX_REMEMBERED_ACCOUNTS],
+            # 有人登录进来了，解除"已退出"标记
+            "logged_out": False,
         }
     )
     target_dir = profile_dir(account_id, user_data_dir)
@@ -162,16 +291,20 @@ def write_profile_meta(account_id: str, user: dict, user_data_dir: str | None = 
 
 
 def clear_profile_meta(account_id: str, user_data_dir: str | None = None) -> None:
-    """清除摘要（退出登录后调用）。
+    """清除某个槽位的本地登录信息（退出登录后调用）。
 
-    只删摘要文件，保留用户目录与标记文件：
-    - 用户目录里是浏览器数据，误删代价大；
-    - 标记文件保留后，界面才能区分"已退出登录"与"从没登录过"。
+    删除摘要、**所有**登录态快照与标记文件，但保留 Chromium 用户目录本身
+    （里面是浏览器数据，误删代价大）。清掉标记文件后，
+    :func:`read_profile_meta` 会回到与"从没登录过"一致的初始状态。
     """
-    try:
-        os.remove(_meta_path(account_id, user_data_dir))
-    except Exception:
-        pass
+    for path in (
+        [_meta_path(account_id, user_data_dir), _marker_path(account_id, user_data_dir)]
+        + _all_state_paths(account_id, user_data_dir)
+    ):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 
 def display_name(meta: dict) -> str:
@@ -288,8 +421,12 @@ class LoginSession:
     def is_open(self) -> bool:
         return self.page is not None
 
-    async def launch(self, url: str = HOME_URL) -> Any:
-        """打开（或复用）浏览器窗口并进入首页。"""
+    async def launch(self, url: str = HOME_URL, *, restore_auth: bool = False) -> Any:
+        """打开（或复用）浏览器窗口并进入首页。
+
+        restore_auth=True 时，若用户目录里的登录 Cookie 已丢失（例如刚"切换账号"
+        退出过），用本地登录态快照把 Cookie 灌回去，避免重新扫码。
+        """
         from playwright.async_api import async_playwright
 
         if self.is_open():
@@ -317,9 +454,20 @@ class LoginSession:
             await self.close()
             raise
 
+        restored = False
+        if restore_auth:
+            restored = await self._restore_auth_state()
+
         self.page.on("close", self._on_page_closed)
         try:
             await self.page.goto(url, timeout=90000, wait_until="domcontentloaded")
+            if restored:
+                # goto 只是同源 hash 跳转，不一定真正重载；补一次 reload，
+                # 让站点重新写 sessionStorage（token 在里面）。
+                try:
+                    await self.page.reload(timeout=60000, wait_until="domcontentloaded")
+                except Exception:
+                    pass
         except Exception as exc:
             self._log(f"[登录] 打开首页超时/失败，稍后可重试：{exc}")
         # 顺带读一次：命中可用登录态时界面能立刻显示当前用户
@@ -335,8 +483,80 @@ class LoginSession:
     def _on_page_closed(self, *_args: Any) -> None:
         self.page = None
 
+    # ── 登录态快照（跨"切换账号"保留登录信息） ───────────────────────────────
+    def _state_candidates(self) -> list[str]:
+        """可用的快照文件，按"当前账号优先、其余按时间倒序"排列。"""
+        current_key = _person_key(self.user)
+        paths = [p for p in _all_state_paths(self.account_id, self.user_data_dir)
+                 if os.path.isfile(p)]
+
+        def sort_key(path: str) -> tuple[int, float]:
+            preferred = 0 if (current_key and current_key in os.path.basename(path).lower()) else 1
+            try:
+                stamp = os.path.getmtime(path)
+            except Exception:
+                stamp = 0.0
+            return (preferred, -stamp)
+
+        return sorted(paths, key=sort_key)
+
+    @staticmethod
+    def _load_state_file(path: str) -> dict | None:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        # 没有任何有意义的 Cookie 就没必要恢复
+        if not any(c.get("name") for c in (data.get("cookies") or [])):
+            return None
+        return data
+
+    async def capture_auth_state(self, person: dict | None = None) -> bool:
+        """把当前 Cookie + localStorage 快照落盘，供下次"切回来"复用。
+
+        快照按人头存（``auth_state.<登录账号>.json``），因此同一槽位换过几个人
+        就会有几份快照，互不覆盖——切回谁都能直接复用。
+        """
+        if self.context is None:
+            return False
+        who = person or self.user
+        path = _person_state_path(self.account_id, who, self.user_data_dir)
+        if not path:
+            # 还不知道是谁，退回旧版单文件命名
+            path = _state_path(self.account_id, self.user_data_dir)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            await self.context.storage_state(path=path)
+            return True
+        except Exception as exc:
+            self._log(f"[登录] 保存登录态快照失败（不影响使用）：{exc}")
+            return False
+
+    async def _restore_auth_state(self) -> bool:
+        """用快照把 Cookie 灌回用户目录（同名 Cookie 会被覆盖）。"""
+        state = None
+        for path in self._state_candidates():
+            state = self._load_state_file(path)
+            if state:
+                break
+        if not state:
+            return False
+        try:
+            await self.context.add_cookies(state.get("cookies") or [])
+        except Exception as exc:
+            self._log(f"[登录] 恢复登录态失败（需要重新登录一次）：{exc}")
+            return False
+        names = [c.get("name") for c in (state.get("cookies") or []) if c.get("name")]
+        self._log(f"[登录] 已用本地快照恢复登录态（{len(names)} 个 Cookie）。")
+        return True
+
     async def close(self) -> None:
         """关闭浏览器并回收 playwright（用户目录里的登录信息不受影响）。"""
+        # 关窗前把登录态快照存下来，方便"切换账号"后切回来
+        await self.capture_auth_state()
         try:
             if self._launched is not None:
                 await self._launched.close()
@@ -488,6 +708,10 @@ class LoginSession:
             user = self._as_user(await _read_page_user(page))
             if user:
                 write_profile_meta(self.account_id, user, self.user_data_dir)
+                # 校验通过顺手更新快照，供"切换账号"后切回来使用
+                self.context = _context
+                await self.capture_auth_state()
+                self.context = None
             return user
         finally:
             try:
@@ -500,8 +724,15 @@ class LoginSession:
             except Exception:
                 pass
 
-    async def logout(self) -> None:
-        """在当前浏览器窗口退出登录，并清除本地保存的登录摘要。"""
+    async def logout(self, *, keep_snapshot: bool = True) -> None:
+        """在当前浏览器窗口退出登录（清 Cookie 与页面内的 token）。
+
+        keep_snapshot=True 时，会在清 Cookie **之前**把登录态快照存下来——
+        顺序很重要：Cookie 一清，快照就只能记录"未登录"状态了。
+        快照的取舍（是否真的换人）由调用方决定。
+        """
+        if keep_snapshot:
+            await self.capture_auth_state()
         if self.is_open():
             clicked = False
             try:
@@ -535,7 +766,6 @@ class LoginSession:
                 await asyncio.sleep(1.5)
             except Exception as exc:
                 self._log(f"[登录] 退出登录时出现问题（可手动在窗口里退出）：{exc}")
-        clear_profile_meta(self.account_id, self.user_data_dir)
         self.user = {}
 
     async def go_home(self) -> None:
@@ -652,14 +882,22 @@ class SessionWorker:
             pass
 
     # ── 命令实现 ─────────────────────────────────────────────────────────────
-    def _get_session(
+    async def _get_session(
         self, account_id: str, browser_pref: str | None = None, *, force: bool = False
     ) -> LoginSession:
-        """取（或新建）当前会话；account_id 变化时自动关掉上一个账号的窗口。"""
+        """取（或新建）当前会话；账号变化时先**等**上一个窗口关干净。
+
+        必须 await 关闭：Chromium 会锁住用户目录，上一个进程没退干净就去开同一个
+        目录会启动失败（随后还会静默降级到别的浏览器、换出一个全新目录，
+        表现就是"登录态莫名其妙丢了"）。
+        """
         if self._session is not None and (force or self._session.account_id != account_id):
-            # 切换账号：关掉上一个账号的窗口，避免两个用户目录互相争抢
-            asyncio.ensure_future(self._session.close())
+            old = self._session
             self._session = None
+            try:
+                await old.close()
+            except Exception:
+                pass
 
         if self._session is None:
             self._session = LoginSession(
@@ -683,19 +921,21 @@ class SessionWorker:
         return self._do_login(account_id, browser_pref, auto_open_modal)
 
     async def _do_login(self, account_id: str, browser_pref: str | None, auto_open_modal: bool):
-        session = self._get_session(account_id, browser_pref)
+        """打开某个槽位：能复用就直接复用，不能就等用户扫码。"""
+        session = await self._get_session(account_id, browser_pref)
         self._emit({"type": "login_state", "account_id": account_id, "state": "opening"})
-        await session.launch()
+        await session.launch(restore_auth=True)
 
-        # 也许上次的登录态还在，先探一次
+        # 上次的登录态还在（或已用快照恢复）→ 直接复用
         existing = await session.read_user()
         if existing:
             write_profile_meta(account_id, existing, self._user_data_dir)
+            await session.capture_auth_state(existing)
             self._emit(
                 {"type": "login_state", "account_id": account_id, "state": "ok", "user": existing}
             )
             self._emit(
-                {"type": "log", "message": f"[登录] 该账号登录信息仍然有效：{display_name(existing)}"}
+                {"type": "log", "message": f"[登录] 登录信息仍有效，直接复用：{display_name(existing)}"}
             )
             return existing
 
@@ -707,6 +947,9 @@ class SessionWorker:
             self._emit({"type": "login_wait", "account_id": account_id, "remain": remain})
 
         user = await session.wait_for_login(on_tick=tick)
+        # 换没换人由登录结果决定，无需用户干预
+        write_profile_meta(account_id, user, self._user_data_dir)
+        await session.capture_auth_state(user)
         self._emit({"type": "login_state", "account_id": account_id, "state": "ok", "user": user})
         self._emit({"type": "log", "message": f"[登录] 登录成功：{display_name(user)}"})
         return user
@@ -718,13 +961,18 @@ class SessionWorker:
         return self._do_use_account(account_id, browser_pref)
 
     async def _do_use_account(self, account_id: str, browser_pref: str | None):
-        """复用已保存的登录信息直接进入（不要求重新扫码）。"""
-        session = self._get_session(account_id, browser_pref)
+        """复用已保存的登录信息直接进入（不要求重新扫码）。
+
+        若用户目录里的 Cookie 已被清（例如本槽位刚"切换账号"退出过），
+        会用登录态快照恢复。
+        """
+        session = await self._get_session(account_id, browser_pref)
         self._emit({"type": "login_state", "account_id": account_id, "state": "opening"})
-        await session.launch()
+        await session.launch(restore_auth=True)
         user = await session.read_user()
         if user:
             write_profile_meta(account_id, user, self._user_data_dir)
+            await session.capture_auth_state()
             self._emit({"type": "login_state", "account_id": account_id, "state": "ok", "user": user})
             return user
         raise LoginRequiredError("保存的登录信息已失效（或该账号还没登录过），请点击「去登录」重新登录。")
@@ -737,11 +985,14 @@ class SessionWorker:
 
     async def _do_switch(self, account_id: str, browser_pref: str | None):
         """切换账号：退出当前账号 → 重新打开登录弹窗等待新账号登录。"""
-        session = self._get_session(account_id, browser_pref, force=True)
+        session = await self._get_session(account_id, browser_pref, force=True)
         self._emit({"type": "login_state", "account_id": account_id, "state": "switching"})
         await session.launch()
 
         previous = await session.read_user(trusted_only=True)
+        previous_name = display_name(previous or {})
+        # 退出前先把登录态快照留好（logout 内部会做），这样万一还是同一个人，
+        # 切回来无需重新扫码；logout 会清掉页面上的登录态。
         await session.logout()
         self._emit(
             {
@@ -774,8 +1025,23 @@ class SessionWorker:
             self._emit({"type": "login_wait", "account_id": account_id, "remain": remain})
 
         user = await session.wait_for_login(on_tick=tick, exclude=exclude)
+        # 换人后只更新"当前是谁"，历史账号与它们的登录态快照都留着，
+        # 所以下次不管想用谁，点一下就能进去，不必重新扫码。
+        write_profile_meta(account_id, user, self._user_data_dir)
+        await session.capture_auth_state(user)
+        known = len(profile_accounts(account_id, self._user_data_dir))
         self._emit({"type": "login_state", "account_id": account_id, "state": "ok", "user": user})
-        self._emit({"type": "log", "message": f"[登录] 已切换到账号：{display_name(user)}"})
+        self._emit(
+            {
+                "type": "log",
+                "message": f"[登录] 已换为：{display_name(user)}"
+                           + (
+                               f"（原账号 {previous_name} 的登录信息已保留，切回它不用重新扫码；"
+                               f"本槽位已保存 {known} 个账号）"
+                               if previous_name else ""
+                           ),
+            }
+        )
         return user
 
     def _cmd_check_saved(
@@ -828,6 +1094,29 @@ class SessionWorker:
                 pass
         self._emit({"type": "log", "message": ">>> 已停止并关闭浏览器（登录信息仍保存在本地）。"})
 
+    def _cmd_logout(
+        self, account_id: str, browser_pref: str | None, user_data_dir: str | None
+    ) -> Any:
+        self._user_data_dir = user_data_dir
+        return self._do_logout(account_id, browser_pref)
+
+    async def _do_logout(self, account_id: str, browser_pref: str | None):
+        """退出某个槽位的登录，但保留历史账号与它们的登录态快照。"""
+        session = await self._get_session(account_id, browser_pref, force=True)
+        self._emit({"type": "login_state", "account_id": account_id, "state": "switching"})
+        await session.launch()
+        previous = await session.read_user(trusted_only=True)
+        await session.logout()
+        mark_logged_out(account_id, self._user_data_dir)
+        self._emit({"type": "login_state", "account_id": account_id, "state": "none"})
+        self._emit(
+            {
+                "type": "log",
+                "message": f">>> 已退出登录：{display_name(previous or {}) or '当前账号'}"
+                           "（登录信息仍保留，下次点登录可直接复用）",
+            }
+        )
+
     def _cmd_run_task(
         self,
         account_id: str,
@@ -839,14 +1128,35 @@ class SessionWorker:
         return self._do_run_task(account_id, task_factory, browser_pref)
 
     async def _do_run_task(self, account_id: str, task_factory: Callable, browser_pref: str | None):
-        """复用当前登录窗口执行刷课任务。
+        """确保已登录，然后执行刷课任务（未登录就先引导登录，一气呵成）。
 
         task_factory(session) 返回一个可 await 的协程（内部调用 Shuake.start()）。
         """
-        session = self._get_session(account_id, browser_pref)
-        if not session.is_open():
-            raise LoginRequiredError("浏览器窗口未打开，请先点击「去登录」。")
+        session = await self._get_session(account_id, browser_pref)
+
+        # 没登录（或窗口未开）时自动走一遍登录流程：能复用就直接复用，
+        # 否则打开浏览器等用户扫码；登录成功后立刻接着开始刷课。
+        if not session.is_open() or not await session.read_user():
+            self._emit(
+                {
+                    "type": "log",
+                    "message": ">>> 该账号还没登录，已打开浏览器窗口，请扫码（或输入账号密码）完成登录，"
+                               "登录成功后会自动开始刷课。",
+                }
+            )
+            await self._do_login(account_id, browser_pref, True)
+
+        session = await self._get_session(account_id, browser_pref)
         await session.ensure_login()
+        # 说明清楚这次用的是谁：登录态绑在槽位目录上，正常不会串，
+        # 但如果你在浏览器窗口里手动登录了别人，这里会如实打印出来。
+        actual = session.user or {}
+        self._emit(
+            {
+                "type": "log",
+                "message": f">>> 本次刷课使用账号：{display_name(actual) or account_id}",
+            }
+        )
         try:
             await task_factory(session)
         finally:

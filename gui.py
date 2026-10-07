@@ -16,8 +16,7 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 
 from browser_launcher import PREF_AUTO, detect_browsers
-from login import ACCOUNT_IDS, SessionWorker, read_profile_meta, display_name
-from login import profile_root
+from login import ACCOUNT_IDS, SessionWorker, display_name
 from app_config import (
     DEFAULT_PROFILE_DIR,
     account_view,
@@ -94,7 +93,7 @@ class App(tk.Tk):
             state_var = tk.StringVar(value="未登录")
             state_label = ttk.Label(acc_frame, textvariable=state_var, width=30, anchor='w')
             state_label.grid(row=row, column=0, padx=4, pady=3, sticky='w')
-            action_btn = ttk.Button(acc_frame, text="去登录", width=12)
+            action_btn = ttk.Button(acc_frame, text="去登录", width=14)
             action_btn.grid(row=row, column=1, padx=4, pady=3, sticky='w')
             action_btn.configure(
                 command=lambda aid=account_id: self._on_account_action(aid)
@@ -104,21 +103,6 @@ class App(tk.Tk):
                 "state_label": state_label,
                 "action_btn": action_btn,
             }
-
-        link_row = ttk.Frame(acc_frame)
-        link_row.grid(row=len(ACCOUNT_IDS) + 1, column=0, columnspan=3, sticky='w', padx=4, pady=(4, 4))
-        ttk.Button(link_row, text="打开登录窗口", command=self._open_login_window).grid(
-            row=0, column=0, padx=(0, 6)
-        )
-        ttk.Button(link_row, text="关闭登录窗口", command=self._close_login_window).grid(
-            row=0, column=1, padx=(0, 6)
-        )
-        ttk.Button(link_row, text="校验登录信息", command=self._check_saved).grid(
-            row=0, column=2, padx=(0, 6)
-        )
-        ttk.Button(link_row, text="打开登录信息目录", command=self._open_profile_folder).grid(
-            row=0, column=3
-        )
 
         # ── 学习目标区 ────────────────────────────────────────────────────────
         goal_frame = ttk.LabelFrame(self, text=" 学习目标（学时） ")
@@ -178,7 +162,7 @@ class App(tk.Tk):
         log_frame.grid(row=3, column=0, columnspan=2, sticky='nsew', **pad)
 
         self._log_box = scrolledtext.ScrolledText(
-            log_frame, width=78, height=18, state='disabled',
+            log_frame, width=78, height=13, state='disabled',
             font=('Consolas', 9), wrap='word'
         )
         self._log_box.pack(fill='both', expand=True, padx=4, pady=4)
@@ -263,13 +247,10 @@ class App(tk.Tk):
         self._append_log(">>> 配置已保存。\n")
 
     def _account_label(self, account_id: str) -> str:
-        """界面上对某个账号的称呼：已登录就用登录用户名，否则用第 N 行（账号N）。"""
-        try:
-            index = ACCOUNT_IDS.index(account_id)
-        except ValueError:
-            index = 0
-        name = account_view(account_id, self._user_data_dir)['name']
-        return name or f"账号{index + 1}"
+        """界面上对某个账号的称呼：已登录用「用户名（账号N）」，未登录用「账号N」。"""
+        view = account_view(account_id, self._user_data_dir)
+        slot = view.get('slot') or account_id
+        return f"{view['name']}（{slot}）" if view['name'] else slot
 
     def _refresh_combo(self):
         """下拉框显示每个账号的登录用户名（未登录则显示账号N）。"""
@@ -344,37 +325,28 @@ class App(tk.Tk):
 
     # ── 登录相关操作 ──────────────────────────────────────────────────────────
     def _on_account_action(self, account_id: str):
-        """账号行按钮：未登录 → 去登录；已登录 → 切换账号。"""
+        """账号行唯一的按钮：没登录就去登录，已登录就退出登录。
+
+        不弹二次确认、不暴露"打开窗口/校验/切换"这些操作：
+        点登录时能复用已保存的登录态就直接进，不能就开窗口等扫码。
+        """
         view = account_view(account_id, self._user_data_dir)
         if view['logged_in']:
-            if not messagebox.askyesno(
-                "切换账号",
-                f"当前登录：{view['name']}\n\n"
-                "切换账号会先在浏览器中退出当前账号，然后等待你登录新账号。是否继续？",
-            ):
-                return
-            self._submit_login('switch_account', account_id, "正在退出当前账号…")
+            self._submit_login('logout', account_id, "正在退出登录…")
         else:
-            self._submit_login('login', account_id, "正在打开浏览器窗口…")
-
-    def _open_login_window(self):
-        account_id = self._selected_account_id()
-        if not account_id:
-            messagebox.showwarning("提示", "请先在「刷课账号」中选择一个账号。")
-            return
-        self._submit_login('login', account_id, "正在打开浏览器窗口…")
+            hint = (
+                f"正在登录（已保存 {view['remembered']} 个账号，能复用就直接进）…"
+                if view['remembered'] else "正在打开浏览器窗口…"
+            )
+            self._submit_login('login', account_id, hint)
 
     def _submit_login(self, command: str, account_id: str, hint: str):
         if self._busy_account:
-            messagebox.showinfo("提示", "上一个登录操作还没结束，请稍候或点击「取消登录」。")
             return
         self._cfg = self._safe_collect()
         self._set_busy(account_id, True)
         self._set_row_state(account_id, hint, '#1d92ff')
-        self._append_log(
-            f"\n>>> {account_id}：{hint}"
-            f"（浏览器：{'自动检测' if self._browser_value.lower() == PREF_AUTO else self._browser_value}）\n"
-        )
+        self._append_log(f"\n>>> {self._account_label(account_id)}：{hint}\n")
         self._worker.submit(
             command,
             account_id,
@@ -392,73 +364,19 @@ class App(tk.Tk):
     def _cancel_login(self):
         if not self._busy_account:
             return
-        self._append_log(">>> 正在取消登录操作…\n")
+        self._append_log(">>> 正在取消当前操作…\n")
         self._cancel_btn.config(state='disabled')
         self._worker.cancel_current()
 
-    def _close_login_window(self):
-        if self._task_running:
-            messagebox.showinfo("提示", "刷课进行中，请先点击「停止」。")
-            return
-        self._worker.submit('close_browser')
-        self._refresh_profiles()
-
-    def _check_saved(self):
-        """静默校验所有账号保存的登录信息是否还有效。"""
-        if self._task_running:
-            messagebox.showinfo("提示", "刷课进行中，暂不校验。")
-            return
-        self._cfg = self._safe_collect()
-        self._append_log("\n>>> 正在校验已保存的登录信息（无头浏览器，请稍候）…\n")
-        checked = 0
-        for account_id in ACCOUNT_IDS:
-            if read_profile_meta(account_id, self._user_data_dir).get('state') == 'none':
-                continue
-            checked += 1
-            self._set_row_state(account_id, "校验中…", '#1d92ff')
-            self._worker.submit(
-                'check_saved', account_id, self._browser_value or PREF_AUTO, self._user_data_dir
-            )
-        if not checked:
-            self._append_log(">>> 还没有任何账号登录过，无需校验。\n")
-
-    def _open_profile_folder(self):
-        path = profile_root(self._user_data_dir)
-        try:
-            os.makedirs(path, exist_ok=True)
-        except Exception as e:
-            messagebox.showerror("打开失败", f"无法创建登录信息目录：{e}")
-            return
-        try:
-            if os.name == 'nt':
-                os.startfile(path)  # noqa: S606 - 打开资源管理器
-            else:
-                messagebox.showinfo("登录信息目录", path)
-        except Exception as e:
-            messagebox.showinfo("登录信息目录", f"{path}\n\n（自动打开失败：{e}）")
-
     # ── 刷课控制 ──────────────────────────────────────────────────────────────
     def _start(self):
+        """开始刷课。若该账号还没登录，会自动先引导登录，然后接着开始刷课。"""
         account_id = self._selected_account_id()
         if not account_id:
-            messagebox.showwarning("提示", "请先选择要刷课的账号。")
             return
-        if self._busy_account:
-            messagebox.showinfo("提示", "登录操作进行中，请等它完成后再开始刷课。")
-            return
-        if self._task_running:
-            messagebox.showinfo("提示", "刷课任务已在运行。")
+        if self._busy_account or self._task_running:
             return
 
-        view = account_view(account_id, self._user_data_dir)
-        if not view['logged_in']:
-            messagebox.showwarning(
-                "提示",
-                f"{self._account_label(account_id)} 还没有登录。\n\n"
-                "请点击它那一行右侧的「去登录」，在打开的浏览器窗口中扫码或输入账号密码完成登录，"
-                "然后回到本窗口点击「开始刷课」。",
-            )
-            return
         try:
             self._cfg = self._collect_fields()
         except ValueError as e:
@@ -471,12 +389,15 @@ class App(tk.Tk):
             messagebox.showwarning("提示", "请至少设置一个大于 0 的目标学时（必修或选修）。")
             return
 
+        view = account_view(account_id, self._user_data_dir)
         save_config(self._cfg)
         browser_desc = (
             "自动检测" if (self._browser_value or '').lower() == PREF_AUTO else self._browser_value
         )
+        who = view['name'] or "待登录"
         self._append_log(
-            f"\n>>> 开始刷课，登录用户：{view['name']}；目标：必修 {m_target} / 选修 {o_target}\n"
+            f"\n>>> 开始刷课，登录用户：{who}（{self._account_label(account_id)}）；"
+            f"目标：必修 {m_target} / 选修 {o_target}\n"
             f">>> 浏览器：{browser_desc}\n"
         )
 
@@ -498,6 +419,8 @@ class App(tk.Tk):
         self._task_running = True
         self._start_btn.config(state='disabled')
         self._stop_btn.config(state='normal')
+        # 未登录时要等用户扫码，得留一个取消入口
+        self._cancel_btn.config(state='normal')
         self._worker.submit(
             'run_task',
             account_id,
@@ -513,6 +436,7 @@ class App(tk.Tk):
         if self._shuake:
             self._shuake.stop()
         self._stop_btn.config(state='disabled')
+        self._cancel_btn.config(state='disabled')
         # 先取消刷课任务（会触发 task_stopped），再关闭浏览器窗口
         self._worker.cancel_current()
         self._worker.submit('stop')
@@ -522,6 +446,7 @@ class App(tk.Tk):
         self._shuake = None
         self._start_btn.config(state='normal')
         self._stop_btn.config(state='disabled')
+        self._set_busy(None, False)
         self._refresh_profiles()
 
     # ── 日志与事件 ────────────────────────────────────────────────────────────
@@ -580,29 +505,24 @@ class App(tk.Tk):
         state = event.get('state')
         user = event.get('user') or {}
 
-        if state == 'ok':
-            name = display_name(user) or '已登录'
-            self._set_row_state(account_id, f"当前登录：{name}", '#1a7f37', button="切换账号")
-            self._append_log(f">>> {name} 登录成功。\n")
-            self._set_busy(None, False)
-            # 下拉框跟着显示登录用户名
-            index = ACCOUNT_IDS.index(account_id) if account_id in ACCOUNT_IDS else 0
-            values = list(self._user_combo['values'])
-            if index < len(values):
-                values[index] = name
-                self._user_combo['values'] = values
-        elif state == 'waiting':
-            self._set_row_state(account_id, "等待登录中…请在浏览器窗口完成登录", '#1d92ff')
+        # 状态文案与按钮统一从磁盘摘要重算，避免界面与落盘信息不一致
+        if state in ('ok', 'none', 'expired'):
+            self._refresh_profiles()
+            if state == 'ok':
+                name = display_name(user) or '已登录'
+                self._append_log(f">>> {name} 登录成功。\n")
+            elif state == 'none':
+                self._append_log(">>> 已退出登录（登录信息仍保留，下次可直接复用）。\n")
+            if not self._task_running:
+                self._set_busy(None, False)
+            return
+
+        if state == 'waiting':
+            self._set_row_state(account_id, "等待扫码登录中…（浏览器窗口已打开）", '#1d92ff')
         elif state == 'switching':
-            self._set_row_state(account_id, "正在退出当前账号…", '#1d92ff')
+            self._set_row_state(account_id, "正在退出登录…", '#1d92ff')
         elif state == 'opening':
             self._set_row_state(account_id, "正在打开浏览器窗口…", '#1d92ff')
-        elif state == 'expired':
-            self._set_row_state(account_id, "登录信息已失效，需重新登录", '#c0392b', button="去登录")
-        elif state == 'none':
-            self._set_row_state(account_id, "未登录", 'gray', button="去登录")
-        if state in ('expired', 'none'):
-            self._set_busy(None, False)
 
     def _append_log(self, text: str):
         self._log_box.config(state='normal')
